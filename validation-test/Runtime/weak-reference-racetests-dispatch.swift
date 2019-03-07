@@ -1,7 +1,7 @@
 // RUN: %target-run-simple-swift
 // REQUIRES: executable_test
 // REQUIRES: stress_test
-// REQUIRES: dispatch
+// REQUIRES: libdispatch
 
 import StdlibUnittest
 import Dispatch

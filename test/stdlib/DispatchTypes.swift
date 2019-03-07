@@ -1,6 +1,6 @@
 // RUN: %target-swift-frontend -typecheck %s
 
-// REQUIRES: dispatch
+// REQUIRES: libdispatch
 
 import Dispatch
 
