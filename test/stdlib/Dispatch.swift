@@ -5,10 +5,9 @@
 // RUN: %target-run %t/a.out
 // REQUIRES: executable_test
 
-// REQUIRES: objc_interop
+// REQUIRES: libdispatch
 
 import Dispatch
-import Foundation
 import StdlibUnittest
 
 
@@ -126,18 +125,6 @@ DispatchAPI.test("DispatchTime.addSubtract") {
 
 	then = DispatchTime.now() - Double.nan
 	expectEqual(DispatchTime.distantFuture, then)
-
-	then = DispatchTime.now() + Date.distantFuture.timeIntervalSinceNow
-	expectEqual(DispatchTime(uptimeNanoseconds: UInt64.max), then)
-
-	then = DispatchTime.now() + Date.distantPast.timeIntervalSinceNow
-	expectEqual(DispatchTime(uptimeNanoseconds: 1), then)
-
-	then = DispatchTime.now() - Date.distantFuture.timeIntervalSinceNow
-	expectEqual(DispatchTime(uptimeNanoseconds: 1), then)
-
-	then = DispatchTime.now() - Date.distantPast.timeIntervalSinceNow
-	expectEqual(DispatchTime(uptimeNanoseconds: UInt64.max), then)
 }
 
 DispatchAPI.test("DispatchWallTime.addSubtract") {
@@ -153,18 +140,6 @@ DispatchAPI.test("DispatchWallTime.addSubtract") {
 	expectEqual(distantPastRawValue, then.rawValue)
 
 	then = DispatchWallTime.now() - Double.nan
-	expectEqual(DispatchWallTime.distantFuture, then)
-
-	then = DispatchWallTime.now() + Date.distantFuture.timeIntervalSinceNow
-	expectEqual(DispatchWallTime.distantFuture, then)
-
-	then = DispatchWallTime.now() + Date.distantPast.timeIntervalSinceNow
-	expectEqual(distantPastRawValue, then.rawValue)
-
-	then = DispatchWallTime.now() - Date.distantFuture.timeIntervalSinceNow
-	expectEqual(distantPastRawValue, then.rawValue)
-
-	then = DispatchWallTime.now() - Date.distantPast.timeIntervalSinceNow
 	expectEqual(DispatchWallTime.distantFuture, then)
 }
 
