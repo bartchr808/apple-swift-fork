@@ -962,7 +962,7 @@ deriveDifferentiable_AssociatedStruct(DerivedConformance &derived,
 
   // Since associated types will be derived, we make this struct a fieldwise
   // differentiable type.
-  if (!nominal->getAttrs().hasAttribute<FieldwiseDifferentiableAttr>())
+  if (!nominal->getAttrs().hasAttribute<FieldwiseDifferentiableAttr>()) // BART: This does not execute when I specify associated types
     nominal->getAttrs().add(
         new (C) FieldwiseDifferentiableAttr(/*implicit*/ true));
 

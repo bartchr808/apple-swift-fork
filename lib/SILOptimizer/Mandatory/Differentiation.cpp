@@ -3248,7 +3248,17 @@ public:
     assert(getterDecl);
     auto *getterFn = getModule().lookUpFunction(
         SILDeclRef(getterDecl, SILDeclRef::Kind::Func));
+    llvm::errs() << "DUMPING SIL FUNCTIONS\n";
     if (!getterFn) {
+      llvm::errs() << "@@@@@@@@@@@@@@@@\n";
+      SILDeclRef(getterDecl, SILDeclRef::Kind::Func).dump();
+      llvm::errs() << SILDeclRef(getterDecl, SILDeclRef::Kind::Func).mangle();
+      llvm::errs() << "@@@@@@@@@@@@@@@@\n";
+      for (auto &block : getModule().getFunctions()) {
+        llvm::errs() << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+        block.dump();
+        llvm::errs() << "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+      }
       context.emitNondifferentiabilityError(
           sei, invoker, diag::autodiff_property_not_differentiable);
       errorOccurred = true;
