@@ -942,84 +942,6 @@ bool Parser::parseDifferentiationParametersClause(
   return false;
 }
 
-bool Parser::parseTransposingParametersClause(
-    SmallVectorImpl<ParsedAutoDiffParameter> &params, StringRef attrName) {
-  // Set parse error, skip until ')' and parse it.
-  auto errorAndSkipToEnd = [&](int parenDepth = 1) -> bool {
-    for (int i = 0; i < parenDepth; i++) {
-      skipUntil(tok::r_paren);
-      if (!consumeIf(tok::r_paren))
-        diagnose(Tok, diag::attr_expected_rparen, attrName,
-                 /*DeclModifier=*/false);
-    }
-    return true;
-  };
-
-  SyntaxParsingContext DiffParamsClauseContext(
-      SyntaxContext, SyntaxKind::DifferentiationParamsClause);
-  consumeToken(tok::identifier);
-  if (!consumeIf(tok::colon)) {
-    diagnose(Tok, diag::expected_colon_after_label, "wrt");
-    return errorAndSkipToEnd();
-  }
-
-  // Function that parses a parameter into `params`. Returns true if error
-  // occurred.
-  auto parseParam = [&](bool parseTrailingComma = true) -> bool {
-    SyntaxParsingContext DiffParamContext(
-        SyntaxContext, SyntaxKind::DifferentiationParam);
-    SourceLoc paramLoc;
-    switch (Tok.getKind()) {
-      case tok::integer_literal: {
-        unsigned int paramNum;
-        if (parseUnsignedInteger(
-                paramNum, paramLoc,
-                diag::transposing_params_clause_expected_parameter))
-          return true;
-
-        params.push_back(ParsedAutoDiffParameter::getOrderedParameter(
-            paramLoc, paramNum));
-        break;
-      }
-      case tok::kw_self: {
-        paramLoc = consumeToken(tok::kw_self);
-        params.push_back(ParsedAutoDiffParameter::getSelfParameter(paramLoc));
-        break;
-      }
-      default:
-        diagnose(Tok, diag::diff_params_clause_expected_parameter);
-        return true;
-    }
-    if (parseTrailingComma && Tok.isNot(tok::r_paren))
-      return parseToken(tok::comma, diag::attr_expected_comma, attrName,
-                        /*isDeclModifier=*/false);
-    return false;
-  };
-
-  // Parse opening '(' of the parameter list.
-  if (Tok.is(tok::l_paren)) {
-    SyntaxParsingContext DiffParamsContext(
-        SyntaxContext, SyntaxKind::DifferentiationParams);
-    consumeToken(tok::l_paren);
-    // Parse first parameter. At least one is required.
-    if (parseParam())
-      return errorAndSkipToEnd(2);
-    // Parse remaining parameters until ')'.
-    while (Tok.isNot(tok::r_paren))
-      if (parseParam())
-        return errorAndSkipToEnd(2);
-    SyntaxContext->collectNodesInPlace(SyntaxKind::DifferentiationParamList);
-    // Parse closing ')' of the parameter list.
-    consumeToken(tok::r_paren);
-  }
-  // If no opening '(' for parameter list, parse a single parameter.
-  else {
-    if (parseParam(/*parseTrailingComma*/ false))
-      return errorAndSkipToEnd();
-  }
-  return false;
-}
-
 bool Parser::parseDifferentiableAttributeArguments(
     bool &linear, SmallVectorImpl<ParsedAutoDiffParameter> &params,
     Optional<DeclNameWithLoc> &jvpSpec, Optional<DeclNameWithLoc> &vjpSpec,
@@ -1240,72 +1162,6 @@ Parser::parseDifferentiatingAttribute(SourceLoc atLoc, SourceLoc loc) {
       DifferentiatingAttr::create(Context, /*implicit*/ false, atLoc,
                                   SourceRange(loc, rParenLoc),
                                   original, linear, params));
-}
-
-// TODO: put in correct implementation
-ParserResult<TransposingAttr>
-Parser::parseTransposingAttribute(SourceLoc atLoc, SourceLoc loc) {
-  StringRef AttrName = "transposing";
-  SourceLoc lParenLoc = loc, rParenLoc = loc;
-  DeclNameWithLoc original;
-  SmallVector<ParsedAutoDiffParameter, 8> params;
-  
-  // Parse trailing comma, if it exists, and check for errors.
-  auto consumeIfTrailingComma = [&]() -> bool {
-    if (!consumeIf(tok::comma)) return false;
-    // Diagnose trailing comma before ')'.
-    if (Tok.is(tok::r_paren)) {
-      diagnose(Tok, diag::unexpected_separator, ",");
-      return true;
-    }
-    // Check that token after comma is 'wrt:'.
-    if (!Tok.is(tok::identifier) || !(Tok.getText() == "wrt")) {
-      diagnose(Tok, diag::attr_transposing_expected_label_linear_or_wrt);
-      return true;
-    }
-    return false;
-  };
-  
-  // Parse '('.
-  if (!consumeIf(tok::l_paren, lParenLoc)) {
-    diagnose(getEndOfPreviousLoc(), diag::attr_expected_lparen, AttrName,
-             /*DeclModifier*/ false);
-    return makeParserError();
-  }
-  
-  {
-    SyntaxParsingContext ContentContext(
-        SyntaxContext, SyntaxKind::DifferentiatingAttributeArguments);
-    
-    {
-      // Parse the name of the function.
-      SyntaxParsingContext FuncDeclNameContext(
-          SyntaxContext, SyntaxKind::FunctionDeclName);
-      original.Name = parseUnqualifiedDeclName(
-          /*afterDot*/ false, original.Loc,
-          diag::attr_transposing_expected_original_name,
-          /*allowOperators*/ true, /*allowZeroArgCompoundNames*/ true);
-      
-      if (consumeIfTrailingComma())
-        return makeParserError();
-    }
-    
-    // Parse the optional 'wrt' differentiation parameters clause.
-    if (Tok.is(tok::identifier) && Tok.getText() == "wrt" &&
-        parseTransposingParametersClause(params, AttrName))
-      return makeParserError();
-  }
-  
-  // Parse ')'.
-  if (!consumeIf(tok::r_paren, rParenLoc)) {
-    diagnose(getEndOfPreviousLoc(), diag::attr_expected_rparen, AttrName,
-             /*DeclModifier*/ false);
-    return makeParserError();
-  }
-  return ParserResult<TransposingAttr>(
-      TransposingAttr::create(Context, /*implicit*/ false, atLoc,
-                                  SourceRange(loc, rParenLoc),
-                                  original, params));
 }
 
 void Parser::parseObjCSelector(SmallVector<Identifier, 4> &Names,
@@ -2126,14 +1982,6 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
   // SWIFT_ENABLE_TENSORFLOW
   case DAK_Differentiating: {
     auto Attr = parseDifferentiatingAttribute(AtLoc, Loc);
-    if (Attr.isNonNull())
-      Attributes.add(Attr.get());
-    break;
-  }
-  
-  // SWIFT_ENABLE_TENSORFLOW
-  case DAK_Transposing: {
-    auto Attr = parseTransposingAttribute(AtLoc, Loc);
     if (Attr.isNonNull())
       Attributes.add(Attr.get());
     break;

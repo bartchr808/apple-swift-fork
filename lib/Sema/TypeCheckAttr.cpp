@@ -136,7 +136,6 @@ public:
   IGNORED_ATTR(Differentiating)
   IGNORED_ATTR(CompilerEvaluable)
   IGNORED_ATTR(NoDerivative)
-  IGNORED_ATTR(Transposing)
 #undef IGNORED_ATTR
 
   void visitAlignmentAttr(AlignmentAttr *attr) {
@@ -865,7 +864,6 @@ public:
   void visitDifferentiatingAttr(DifferentiatingAttr *attr);
   void visitCompilerEvaluableAttr(CompilerEvaluableAttr *attr);
   void visitNoDerivativeAttr(NoDerivativeAttr *attr);
-  void visitTransposingAttr(TransposingAttr *attr);
 };
 } // end anonymous namespace
 
@@ -3631,34 +3629,6 @@ void AttributeChecker::visitDifferentiatingAttr(DifferentiatingAttr *attr) {
     }
     da->setVJPFunction(derivative);
     break;
-  }
-}
-
-void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
-  auto &ctx = TC.Context;
-  FuncDecl *derivative = dyn_cast<FuncDecl>(D);
-  auto lookupConformance =
-  LookUpConformanceInModule(D->getDeclContext()->getParentModule());
-  auto original = attr->getOriginal();
-
-  auto *transposeInterfaceType = derivative->getInterfaceType()
-  ->eraseDynamicSelfType()->castTo<AnyFunctionType>();
-  auto transposeResultType = derivative->getResultInterfaceType();
-
-  // Result type must conform to `Differentiable`.
-  auto diffableProto = ctx.getProtocol(KnownProtocolKind::Differentiable);
-  auto valueResultType = transposeResultType;
-  if (valueResultType->hasTypeParameter())
-    valueResultType = derivative->mapTypeIntoContext(valueResultType);
-  auto valueResultConf = TC.conformsToProtocol(valueResultType, diffableProto,
-                                               derivative->getDeclContext(),
-                                               None);
-  if (!valueResultConf) {
-    TC.diagnose(attr->getLocation(),
-                diag::transposing_attr_result_value_not_differentiable,
-                transposeResultType);
-    attr->setInvalid();
-    return;
   }
 }
 
