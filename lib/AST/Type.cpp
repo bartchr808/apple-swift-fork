@@ -4687,19 +4687,26 @@ makeFunctionType(
 AnyFunctionType *
 AnyFunctionType::getTransposeOriginalFunctionType(
     TransposingAttr *attr,
-    AutoDiffIndexSubset *wrtParamIndices) {
-  auto transposeParams = getParams();
+    AutoDiffIndexSubset *wrtParamIndices,
+bool wrtSelf) {
   unsigned transposeParamsIndex = 0;
-  auto transposeResult = getResult();
+  bool isCurried = getResult()->is<AnyFunctionType>();
   
   // Get the original function's result.
-  bool isCurried = getResult()->is<AnyFunctionType>();
-  Type originalResult;
+  auto transposeParams = getParams();
+  auto transposeResult = getResult();
   if (isCurried) {
-    // If it's curried, then the first parameter in the curried type,
-    // which is the 'Self' type, is the original result (no matter if we
-    // are differentiating WRT self or aren't).
-    originalResult = transposeParams.front().getPlainType();
+    auto method = getAs<AnyFunctionType>()->getResult()->getAs<AnyFunctionType>();
+    transposeParams = method->getParams();
+    transposeResult = method->getResult();
+  }
+      
+  Type originalResult;
+  if (isCurried && wrtSelf) {
+    // If it's curried and are differentiating WRT `Self`, then the first
+    // parameter in the curried type, which is the 'Self' type, is the
+    // original result (no matter if we are differentiating WRT self or aren't).
+    originalResult = getParams().front().getPlainType();
   } else {
     // If it's not curried, the last parameter, the tangent, is always the
     // original result type as we require the last parameter of the transposing
@@ -4707,15 +4714,6 @@ AnyFunctionType::getTransposeOriginalFunctionType(
     originalResult = transposeParams.back().getPlainType();
   }
   assert(originalResult);
-
-  if (isCurried) {
-    // If it's curried, then we need to get the parameters and result of the
-    // method inside.
-    transposeParams = transposeResult->getAs<AnyFunctionType>()
-                          ->getParams();
-    transposeResult = transposeResult->getAs<AnyFunctionType>()
-                          ->getResult();
-  }
 
   auto wrtParams = attr->getParsedParameters();
   ArrayRef<TupleTypeElt> transposeResultTypes;
@@ -4729,22 +4727,23 @@ AnyFunctionType::getTransposeOriginalFunctionType(
   }
   assert(!transposeResultTypes.empty());
 
-  bool wrtSelf = wrtParamIndices->contains(wrtParamIndices->getCapacity() - 1);
-
   // If the function is curried and is transposing WRT 'self', then grab
   // the type from the result list (guaranteed to be the first since 'self'
   // is first in WRT list) and remove it. If it's still curried but not
-  // transposing WRT 'self', then the 'Self' type is the same as the result.
-  Type selfType = originalResult;
+  // transposing WRT 'self', then the 'Self' type is the same as before.
+  Type selfType;
   if (isCurried && wrtSelf) {
     selfType = transposeResultTypes[transposeResultTypesIndex].getType();
     transposeResultTypesIndex++;
+  } else if (isCurried) {
+    selfType = getParams().front().getPlainType();
   }
+  assert(selfType);
 
   SmallVector<AnyFunctionType::Param, 8> originalParams;
   unsigned numberOriginalParameters =
       transposeParams.size() + wrtParams.size() - 1;
-  for (auto i : range(numberOriginalParameters)) {
+  for (auto i : range(numberOriginalParameters - transposeResultTypesIndex)) {
     bool isWrt = wrtParamIndices->contains(i);
     if (isWrt) {
       // If in WRT list, the item in the result tuple must be a parameter in the
@@ -4758,6 +4757,19 @@ AnyFunctionType::getTransposeOriginalFunctionType(
     } else {
       // Else if not in the WRT list, the parameter in the transposing function
       // is a parameter in the original function.
+      // TODO(bartchr): error!
+//      extension Float {
+//        func getDouble() -> Double {
+//          return Double(self)
+//        }
+//      }
+//      
+//      extension Double {
+//        @transposing(Float.getDouble, wrt: self)
+//        func structTranspose() -> Float {
+//          return Float(self)
+//        }
+//      }
       originalParams.push_back(transposeParams[transposeParamsIndex]);
       transposeParamsIndex++;
     }
