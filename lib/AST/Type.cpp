@@ -4734,17 +4734,18 @@ bool wrtSelf) {
   Type selfType;
   if (isCurried && wrtSelf) {
     selfType = transposeResultTypes[transposeResultTypesIndex].getType();
-    transposeResultTypesIndex++;
   } else if (isCurried) {
     selfType = getParams().front().getPlainType();
   }
-  assert(selfType);
 
   SmallVector<AnyFunctionType::Param, 8> originalParams;
   unsigned numberOriginalParameters =
       transposeParams.size() + wrtParams.size() - 1;
   for (auto i : range(numberOriginalParameters - transposeResultTypesIndex)) {
-    bool isWrt = wrtParamIndices->contains(i);
+    bool isSelfParam = i == 0 && wrtSelf;
+    // Need to check if it is the 'self' param since we handle it differentl
+    // above.
+    bool isWrt = wrtParamIndices->contains(i) && !isSelfParam;
     if (isWrt) {
       // If in WRT list, the item in the result tuple must be a parameter in the
       // original function.
@@ -4758,18 +4759,6 @@ bool wrtSelf) {
       // Else if not in the WRT list, the parameter in the transposing function
       // is a parameter in the original function.
       // TODO(bartchr): error!
-//      extension Float {
-//        func getDouble() -> Double {
-//          return Double(self)
-//        }
-//      }
-//      
-//      extension Double {
-//        @transposing(Float.getDouble, wrt: self)
-//        func structTranspose() -> Float {
-//          return Float(self)
-//        }
-//      }
       originalParams.push_back(transposeParams[transposeParamsIndex]);
       transposeParamsIndex++;
     }
@@ -4780,6 +4769,7 @@ bool wrtSelf) {
                           originalResult,
                           isCurried ? nullptr : getOptGenericSignature());
   if (isCurried) {
+    assert(selfType);
     // If curried, wrap the function into the 'Self' type to get a method.
     originalType = makeFunctionType(AnyFunctionType::Param(selfType),
                                     originalType,

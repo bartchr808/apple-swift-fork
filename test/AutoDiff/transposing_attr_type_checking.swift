@@ -92,7 +92,7 @@ func missingDiffSelfRequirementT<T: AdditiveArithmetic>(x: T) -> T {
   return x
 }
 
-// TODO: error should be "can only differentiate with respect to parameters that conform to 'Differentiable' and where 'T == T.TangentVector'"
+// TODO: error should be "can only transpose with respect to parameters that conform to 'Differentiable' and where 'Int == Int.TangentVector'"
 // but currently there is an assertion failure.
 /*func missingSelfRequirement<T: Differentiable>(x: T) 
   -> T where T.TangentVector == T {
@@ -125,7 +125,7 @@ func transposingInt(x: Float, y: Int) -> Float {
   }
 }
 
-// expected-error @+1 {{can only differentiate with respect to parameters that conform to 'Differentiable' and where 'Int == Int.TangentVector'}}
+// expected-error @+1 {{can only transpose with respect to parameters that conform to 'Differentiable' and where 'Int == Int.TangentVector'}}
 @transposing(transposingInt, wrt: 1) 
 func transposingIntT1(x: Float, t: Float) -> Int {
   return Int(x)

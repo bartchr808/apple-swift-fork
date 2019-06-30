@@ -4003,8 +4003,11 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
     return true;
   };
 
-  auto lookupOptions = defaultMemberLookupOptions
-  | NameLookupFlags::IgnoreAccessControl;
+  auto baseType = Type();
+  auto lookupOptions = (baseType
+      ? defaultMemberLookupOptions
+      : defaultUnqualifiedLookupOptions)
+      | NameLookupFlags::IgnoreAccessControl;
   auto transposeTypeCtx = transpose->getInnermostTypeContext();
   if (!transposeTypeCtx) transposeTypeCtx = transpose->getParent();
   assert(transposeTypeCtx);
@@ -4015,7 +4018,7 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
     funcLoc = attr->getBaseType()->getLoc();
   
   auto *originalFn = TC.lookupFuncDecl(
-      original.Name, funcLoc, /*baseType*/ Type(),
+      original.Name, funcLoc, baseType,
       transposeTypeCtx, isValidOriginal, overloadDiagnostic,
       ambiguousDiagnostic, notFunctionDiagnostic, lookupOptions,
       hasValidTypeContext, invalidTypeContextDiagnostic);
