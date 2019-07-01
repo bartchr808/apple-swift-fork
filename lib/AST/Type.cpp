@@ -4702,10 +4702,10 @@ bool wrtSelf) {
   }
       
   Type originalResult;
-  if (isCurried && wrtSelf) {
-    // If it's curried and are differentiating WRT `Self`, then the first
-    // parameter in the curried type, which is the 'Self' type, is the
-    // original result (no matter if we are differentiating WRT self or aren't).
+  if (isCurried) {
+    // If it's curried, then the first parameter in the curried type, which is
+    // the 'Self' type, is the original result (no matter if we are
+    // differentiating WRT self or aren't).
     originalResult = getParams().front().getPlainType();
   } else {
     // If it's not curried, the last parameter, the tangent, is always the
@@ -4730,19 +4730,21 @@ bool wrtSelf) {
   // If the function is curried and is transposing WRT 'self', then grab
   // the type from the result list (guaranteed to be the first since 'self'
   // is first in WRT list) and remove it. If it's still curried but not
-  // transposing WRT 'self', then the 'Self' type is the same as before.
+  // transposing WRT 'self', then the 'Self' type is the first parameter
+  // in the method.
   Type selfType;
   if (isCurried && wrtSelf) {
     selfType = transposeResultTypes[transposeResultTypesIndex].getType();
     transposeResultTypesIndex++;
   } else if (isCurried) {
-    selfType = getParams().front().getPlainType();
+    selfType = transposeParams.front().getPlainType();
+    transposeParamsIndex++;
   }
 
   SmallVector<AnyFunctionType::Param, 8> originalParams;
   unsigned numberOriginalParameters =
       transposeParams.size() + wrtParams.size() - 1;
-  for (auto i : range(transposeResultTypesIndex, std::max(numberOriginalParameters, transposeResultTypesIndex))) {
+  for (auto i : range(transposeResultTypesIndex, numberOriginalParameters + transposeResultTypesIndex)) {
     // Need to check if it is the 'self' param since we handle it differently
     // above.
     bool isWrt = wrtParamIndices->contains(i);

@@ -3923,17 +3923,15 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
   auto *expectedOriginalFnType =
       transposeInterfaceType->getTransposeOriginalFunctionType(
           attr, wrtParamIndices, wrtSelf);
-  expectedOriginalFnType->dump();
 
   // `R` result type must conform to `Differentiable`.
-  auto diffableProto = ctx.getProtocol(KnownProtocolKind::Differentiable);
   auto valueResultType = expectedOriginalFnType->getResult();
   if (isCurried) {
     valueResultType = transpose->mapTypeIntoContext(valueResultType->getAs<AnyFunctionType>()->getResult());
   }
   if (valueResultType->hasTypeParameter())
     valueResultType = transpose->mapTypeIntoContext(valueResultType);
-
+  auto diffableProto = ctx.getProtocol(KnownProtocolKind::Differentiable);
   auto valueResultConf = TC.conformsToProtocol(
                              valueResultType, diffableProto,
                              transpose->getDeclContext(), None);

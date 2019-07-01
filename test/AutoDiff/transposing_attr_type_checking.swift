@@ -6,7 +6,7 @@ func linearFunc(_ x: Float) -> Float {
   return x
 }
 
-@transposing(linearFunc, wrt: 0) // ok
+@transposing(linearFunc, wrt: 0) 
 func transposingLinearFunc(x: Float) -> Float {
   return x
 }
@@ -15,17 +15,17 @@ func twoParams(_ x: Float, _ y: Double) -> Double {
   return Double(x) + y
 }
 
-@transposing(twoParams, wrt: 0) // ok
+@transposing(twoParams, wrt: 0) 
 func twoParamsT1(_ y: Double, _ t: Double) ->  Float {
   return Float(t + y)
 }
 
-@transposing(twoParams, wrt: 1) // ok
+@transposing(twoParams, wrt: 1) 
 func twoParamsT2(_ x: Float, _ t: Double) ->  Double {
   return Double(x) + t
 }
 
-@transposing(twoParams, wrt: (0, 1)) // ok
+@transposing(twoParams, wrt: (0, 1)) 
 func twoParamsT3(_ t: Double) ->  (Float, Double) {
   return (Float(t), t)
 }
@@ -34,33 +34,33 @@ func threeParams(_ x: Float, _ y: Double, _ z: Float) -> Double {
   return Double(x) + y
 }
 
-@transposing(threeParams, wrt: 0) // ok
+@transposing(threeParams, wrt: 0) 
 func threeParamsT1(_ y: Double, _ z: Float, _ t: Double) -> Float {
   return Float(t + y) + z
 }
 
-@transposing(threeParams, wrt: 1) // ok
+@transposing(threeParams, wrt: 1) 
 func threeParamsT2(_ x: Float, _ z: Float, _ t: Double) -> Double {
   return Double(x + z) + t
 }
 
-@transposing(threeParams, wrt: 2) // ok
+@transposing(threeParams, wrt: 2) 
 func threeParamsT3(_ x: Float, _ y: Double, _ t: Double) -> Float {
   return Float(y + t) + x
 }
 
-@transposing(threeParams, wrt: (0, 1)) // ok
+@transposing(threeParams, wrt: (0, 1)) 
 func threeParamsT4(_ z: Float, _ t: Double) -> (Float, Double) {
   return (z + Float(t), Double(z) + t)
 }
 
-@transposing(threeParams, wrt: (0, 2)) // ok
+@transposing(threeParams, wrt: (0, 2))
 func threeParamsT5(_ y: Double, _ t: Double) -> (Float, Float) {
   let ret = Float(y + t)
   return (ret, ret)
 }
 
-@transposing(threeParams, wrt: (0, 1, 2)) // ok
+@transposing(threeParams, wrt: (0, 1, 2))
 func threeParamsT5(_ t: Double) -> (Float, Double, Float) {
   let ret = Float(t)
   return (ret, t, ret)
@@ -70,7 +70,7 @@ func generic<T: Differentiable>(x: T) -> T where T == T.TangentVector {
   return x
 }
 
-@transposing(generic, wrt: 0) // ok
+@transposing(generic, wrt: 0)
 func genericT<T: Differentiable>(x: T) -> T where T == T.TangentVector {
   return x
 }
@@ -83,7 +83,7 @@ func withInt(x: Float, y: Int) -> Float {
   }
 }
 
-@transposing(withInt, wrt: 0) // ok
+@transposing(withInt, wrt: 0)
 func withIntT(x: Int, t: Float) -> Float {
   return t
 }
@@ -165,101 +165,131 @@ extension Float {
   func adding(_ double: Double) -> Float {
     return self + Float(double)
   }
+
+  @transposing(Float.adding, wrt: 0)
+  func addingT1(t: Float) -> Double {
+    return Double(self + t)
+  }
+
+  @transposing(Float.adding, wrt: self)
+  func addingT2(_ double: Double) -> Float {
+    return self + Float(double)
+  }
     
   @transposing(Float.adding, wrt: (self, 0))
-  func tran(t: Float) -> (Float, Double) {
-    return (t, Double(t))
+  func addingT3() -> (Float, Double) {
+    return (self, Double(self))
   }
+}
+
+// Different self type/result type.
+extension Int {
+  func myAdding(_ double: Double) -> Float {
+    return Float(double)
+  }
+}
+
+extension Float {
+  @transposing(Int.myAdding, wrt: 0)
+  func addingT3(t: Int) -> Double {
+    return Double(self)
+  }
+
+  // TODO: throw an error due to Int not being differentiable.
+  // @transposing(Int.myAdding, wrt: (self, 0))
+  // func addingT3() -> (Int, Double) {
+  //   return (Int(self), Double(self))
+  // }
 }
 
 // Static method.
-struct A : Differentiable & AdditiveArithmetic {
-  public typealias TangentVector = A
-  var x: Double
-  static prefix func -(a: A) -> A {
-    return A(x: -a.x)
-  }
-}
+// struct A : Differentiable & AdditiveArithmetic {
+//   public typealias TangentVector = A
+//   var x: Double
+//   static prefix func -(a: A) -> A {
+//     return A(x: -a.x)
+//   }
 
-extension A {
-  @transposing(A.-, wrt: 0)
-  static func negationT(a: A) -> A {
-    return A(x: -a.x)
-  }
-}
+//   @transposing(A.-, wrt: 0)
+//   static func negationT(a: A) -> A {
+//     return A(x: -a.x)
+//   }
+// }
 
 // Method with 3 parameters.
 extension Float {
   func threeParams(_ x: Float, _ y: Double, _ z: Float) -> Double {
-    return Double(self) + Double(x) + y
-  }
-
-  @transposing(Float.threeParams, wrt: 0) // ok
-  func threeParamsT1(_ y: Double, _ z: Float, _ t: Double) -> Float {
-    return self + Float(t + y) + z
-  }
-
-  @transposing(Float.threeParams, wrt: 1) // ok
-  func threeParamsT2(_ x: Float, _ z: Float, _ t: Double) -> Double {
-    return Double(self) + Double(x + z) + t
-  }
-
-  @transposing(Float.threeParams, wrt: 2) // ok
-  func threeParamsT3(_ x: Float, _ y: Double, _ t: Double) -> Float {
-    return self + Float(y + t) + x
-  }
-
-  @transposing(Float.threeParams, wrt: (0, 1)) // ok
-  func threeParamsT4(_ z: Float, _ t: Double) -> (Float, Double) {
-    return (self + z + Float(t), Double(self) + Double(z) + t)
-  }
-
-  @transposing(Float.threeParams, wrt: (0, 2)) // ok
-  func threeParamsT5(_ y: Double, _ t: Double) -> (Float, Float) {
-    let ret = self + Float(y + t)
-    return (ret, ret)
-  }
-
-  @transposing(Float.threeParams, wrt: (0, 1, 2)) // ok
-  func threeParamsT5(_ t: Double) -> (Float, Double, Float) {
-    return (self + Float(t), Double(self) +  t, self + Float(t))
+    return Double(self + x + z) + y
   }
 }
 
 extension Double {
-  @transposing(Float.threeParams, wrt: self) // ok
-  func threeParamsT6(_ x: Float, _ y: Double, _ z: Float) -> Float {
-    return Float(self + y) + x
+  @transposing(Float.threeParams, wrt: 0) 
+  func threeParamsT1(_ s: Float, _ y: Double, _ z: Float) -> Float {
+    return Float(self + y) + s + z
   }
 
-  // @transposing(Float.threeParams, wrt: (self, 0)) // ok
-  // func threeParamsT7(_ y: Double, _ z: Float, _ t: Double) -> Float {
-  //   return Float(self) + Float(t + y) + z
+  @transposing(Float.threeParams, wrt: 1) 
+  func threeParamsT2(_ x: Float, _ s: Float, _ y: Float) -> Double {
+    return self + Double(x + s + y)
+  }
+
+  // @transposing(Float.threeParams, wrt: 2) 
+  // func threeParamsT3(_ x: Float, _ y: Double, _ t: Double) -> Float {
+  //   return Float(self + y + t) + x
   // }
 
-  // @transposing(Float.threeParams, wrt: (self, 1)) // ok
-  // func threeParamsT8(_ x: Float, _ z: Float, _ t: Double) -> Double {
-  //   return self + Double(x + z) + t
+  // @transposing(Float.threeParams, wrt: (0, 1)) 
+  // func threeParamsT4(_ z: Float, _ t: Double) -> (Float, Double) {
+  //   return (z + Float(self + t), self + Double(z) + t)
   // }
 
-  // @transposing(Float.threeParams, wrt: (self, 2)) // ok
-  // func threeParamsT9(_ x: Float, _ y: Double, _ t: Double) -> Float {
-  //   return Float(self) + Float(y + t) + x
-  // }
-
-  // @transposing(Float.threeParams, wrt: (self, 0, 1)) // ok
-  // func threeParamsT10(_ z: Float, _ t: Double) -> (Float, Double) {
-  //   return (Float(self) + z + Float(t), self + Double(z) + t)
-  // }
-
-  // @transposing(Float.threeParams, wrt: (self, 0, 2)) // ok
-  // func threeParamsT11(_ y: Double, _ t: Double) -> (Float, Float) {
-  //   let ret = Float(self) + Float(y + t)
+  // @transposing(Float.threeParams, wrt: (0, 2)) 
+  // func threeParamsT5(_ y: Double, _ t: Double) -> (Float, Float) {
+  //   let ret = Float(self + y + t)
   //   return (ret, ret)
   // }
 
-  // @transposing(Float.threeParams, wrt: (self, 0, 1, 2)) // ok
-  // func threeParamsT12(_ t: Double) -> (Float, Double, Float) {
-  //   return (Float(self + t), self +  t, Float(self + t))
+  // @transposing(Float.threeParams, wrt: (0, 1, 2)) 
+  // func threeParamsT5(_ t: Double) -> (Float, Double, Float) {
+  //   return (Float(self + t), Double(self) +  t, Float(self + t))
   // }
 }
+
+// extension Double {
+//   @transposing(Float.threeParams, wrt: self) 
+//   func threeParamsT6(_ x: Float, _ y: Double, _ z: Float) -> Float {
+//     return Float(self + y) + x
+//   }
+
+//   @transposing(Float.threeParams, wrt: (self, 0)) 
+//   func threeParamsT7(_ y: Double, _ z: Float, _ t: Double) -> Float {
+//     return Float(self) + Float(t + y) + z
+//   }
+
+//   @transposing(Float.threeParams, wrt: (self, 1)) 
+//   func threeParamsT8(_ x: Float, _ z: Float, _ t: Double) -> Double {
+//     return self + Double(x + z) + t
+//   }
+
+//   @transposing(Float.threeParams, wrt: (self, 2)) 
+//   func threeParamsT9(_ x: Float, _ y: Double, _ t: Double) -> Float {
+//     return Float(self) + Float(y + t) + x
+//   }
+
+//   @transposing(Float.threeParams, wrt: (self, 0, 1)) 
+//   func threeParamsT10(_ z: Float, _ t: Double) -> (Float, Double) {
+//     return (Float(self) + z + Float(t), self + Double(z) + t)
+//   }
+
+//   @transposing(Float.threeParams, wrt: (self, 0, 2)) 
+//   func threeParamsT11(_ y: Double, _ t: Double) -> (Float, Float) {
+//     let ret = Float(self) + Float(y + t)
+//     return (ret, ret)
+//   }
+
+//   @transposing(Float.threeParams, wrt: (self, 0, 1, 2)) 
+//   func threeParamsT12(_ t: Double) -> (Float, Double, Float) {
+//     return (Float(self + t), self +  t, Float(self + t))
+//   }
+// }
