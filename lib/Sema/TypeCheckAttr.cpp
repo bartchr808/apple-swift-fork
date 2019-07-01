@@ -3034,8 +3034,8 @@ static AutoDiffIndexSubset *computeTransposingParameters(
 //        function, derivativeGenEnv);
   
   // Otherwise, build parameter indices from parsed differentiation parameters.
-  unsigned numParams = params.size() + transposeResultTypes.size() - 1;
-  auto paramIndices = SmallBitVector(numParams + (unsigned)wrtSelf);
+  unsigned numParams = params.size() + transposeResultTypes.size() - 1 + wrtSelf;
+  auto paramIndices = SmallBitVector(numParams);
   int lastIndex = -1;
   for (unsigned i : indices(parsedWrtParams)) {
     auto paramLoc = parsedWrtParams[i].getLoc();
@@ -3922,6 +3922,7 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
   auto *expectedOriginalFnType =
       transposeInterfaceType->getTransposeOriginalFunctionType(
           attr, wrtParamIndices, wrtSelf);
+  expectedOriginalFnType->dump();
 
   // `R` result type must conform to `Differentiable`.
   auto diffableProto = ctx.getProtocol(KnownProtocolKind::Differentiable);
@@ -3966,6 +3967,36 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
                      }, lookupConformance, None)
                             == RequirementCheckResult::Success;
   };
+  
+  auto isValidOriginal = [&](FuncDecl *originalCandidate) {
+    TC.validateDeclForNameLookup(originalCandidate);
+    return checkFunctionSignature(
+               cast<AnyFunctionType>(expectedOriginalFnType->getCanonicalType()),
+               originalCandidate->getInterfaceType()->getCanonicalType(),
+               checkGenericSignatureSatisfied);
+  };
+  
+  // TODO: Do not reuse incompatible `@differentiable` attribute diagnostics.
+  // Rename compatible diagnostics so that they're not attribute-specific.
+  auto overloadDiagnostic = [&]() {
+    TC.diagnose(original.Loc, diag::differentiating_attr_overload_not_found,
+                original.Name, expectedOriginalFnType);
+  };
+  auto ambiguousDiagnostic = [&]() {
+    TC.diagnose(original.Loc,
+                diag::differentiable_attr_ambiguous_function_identifier,
+                original.Name);
+  };
+  auto notFunctionDiagnostic = [&]() {
+    TC.diagnose(original.Loc, diag::differentiable_attr_specified_not_function,
+                original.Name);
+  };
+  std::function<void()> invalidTypeContextDiagnostic = [&]() {
+    TC.diagnose(original.Loc,
+                diag::differentiable_attr_function_not_same_type_context,
+                original.Name);
+  };
+
 
   // Returns true if the derivative function and original function candidate are
   // defined in compatible type contexts. If the derivative function and the
@@ -3978,10 +4009,10 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
   auto baseType = Type();
   if (attr->getBaseType())
     baseType = typeRes.resolveType(attr->getBaseType(), None);
-  auto lookupOptions = (baseType
-      ? NL_QualifiedDefault
-      : NL_UnqualifiedDefault)
-      | NL_IgnoreAccessControl;
+  auto lookupOptions = (attr->getBaseType()
+                            ? defaultMemberLookupOptions
+                            : defaultUnqualifiedLookupOptions)
+                            | NameLookupFlags::IgnoreAccessControl;
   auto transposeTypeCtx = transpose->getInnermostTypeContext();
   if (!transposeTypeCtx) transposeTypeCtx = transpose->getParent();
   assert(transposeTypeCtx);
@@ -3990,19 +4021,20 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
   auto funcLoc = original.Loc.getBaseNameLoc();
   if (attr->getBaseType())
     funcLoc = attr->getBaseType()->getLoc();
-  SmallVector<ValueDecl *, 1> foundOriginalFuncs;
-  transpose->lookupQualified(baseType, original.Name, lookupOptions, transpose->getASTContext().getLazyResolver(), foundOriginalFuncs);
-  
-  for (auto func : foundOriginalFuncs)
-    llvm::errs() << func->getFullName() << "\n";
+  auto *originalFn = TC.lookupFuncDecl(
+      original.Name, funcLoc, baseType,
+      transposeTypeCtx, isValidOriginal, overloadDiagnostic,
+      ambiguousDiagnostic, notFunctionDiagnostic, lookupOptions,
+      hasValidTypeContext, invalidTypeContextDiagnostic);
 
-  if (foundOriginalFuncs.empty()) {
-    D->getAttrs().removeAttribute(attr); // TODO(bartchr): this shouldn't be necessary
+  if (!originalFn) {
+    // TODO(bartchr): removing attr shouldn't be necessary, but in testing
+    // printing the AST it sometimes prints.
+    D->getAttrs().removeAttribute(attr);
     attr->setInvalid();
     return;
   }
-  // TODO: need a for-loop in case multiple matches
-  auto *originalFn = dyn_cast<FuncDecl>(foundOriginalFuncs.front());
+
   attr->setOriginalFunction(originalFn);
 
   // Gather differentiation parameters.

@@ -1,6 +1,6 @@
 // RUN: %target-swift-frontend -typecheck -verify %s
 
-// Test top-level functions.
+// ~~~~~~~~~~~~~ Test top-level functions. ~~~~~~~~~~~~~
 
 func linearFunc(_ x: Float) -> Float {
   return x
@@ -136,4 +136,48 @@ func transposingIntT1(x: Float, t: Float) -> Int {
 @transposing(transposingInt, wrt: 0)
 func tangentNotLast(t: Float, y: Int) -> Float {
   return t
+}
+
+// ~~~~~~~~~~~~~ Test methods. ~~~~~~~~~~~~~
+
+// Method no parameters.
+extension Float {
+  func getDouble() -> Double {
+      return Double(self)
+  }
+}
+
+extension Double {
+  @transposing(Float.getDouble, wrt: self)
+  func structTranspose() -> Float {
+    return Float(self)
+  }
+}
+
+// Method with params.
+// extension Float {
+//   func adding(_ double: Double) -> Float {
+//     return self + Float(double)
+//   }
+    
+//   @transposing(Float.adding, wrt: (self, 0))
+//   func tran(t: Float) -> (Float, Double) {
+//     return (t, Double(t))
+//   }
+// }
+
+// Static method
+struct A : Differentiable & AdditiveArithmetic {
+  public typealias TangentVector = A
+  var x: Double
+  static func f (a: A) -> A {
+    return A(x: -a.x)
+  }
+}
+
+extension A {
+  @transposing(A.f, wrt: 0)
+  static func negationT(a: A) -> A {
+    return A(x: -a.x)
+  }
 }

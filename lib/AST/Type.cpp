@@ -4734,6 +4734,7 @@ bool wrtSelf) {
   Type selfType;
   if (isCurried && wrtSelf) {
     selfType = transposeResultTypes[transposeResultTypesIndex].getType();
+    transposeResultTypesIndex++;
   } else if (isCurried) {
     selfType = getParams().front().getPlainType();
   }
@@ -4741,11 +4742,10 @@ bool wrtSelf) {
   SmallVector<AnyFunctionType::Param, 8> originalParams;
   unsigned numberOriginalParameters =
       transposeParams.size() + wrtParams.size() - 1;
-  for (auto i : range(numberOriginalParameters - transposeResultTypesIndex)) {
-    bool isSelfParam = i == 0 && wrtSelf;
-    // Need to check if it is the 'self' param since we handle it differentl
+  for (auto i : range(transposeResultTypesIndex, std::max(numberOriginalParameters, transposeResultTypesIndex))) {
+    // Need to check if it is the 'self' param since we handle it differently
     // above.
-    bool isWrt = wrtParamIndices->contains(i) && !isSelfParam;
+    bool isWrt = wrtParamIndices->contains(i);
     if (isWrt) {
       // If in WRT list, the item in the result tuple must be a parameter in the
       // original function.
