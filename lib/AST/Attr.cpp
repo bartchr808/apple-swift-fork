@@ -415,7 +415,7 @@ static std::string getTransposingParametersClauseString(
     }
     // Print remaining differentiation parameters.
     interleave(parameters.set_bits(), [&](unsigned index) {
-      printer << parsedParams[index].getIndex();
+      printer << index;
     }, [&] { printer << ", "; });
     if (parameterCount > 1)
       printer << ')';

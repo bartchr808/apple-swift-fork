@@ -3915,6 +3915,7 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
                           transpose->getGenericEnvironment(),
                           attr->getLocation());
   if (!wrtParamIndices) {
+    D->getAttrs().removeAttribute(attr);
     attr->setInvalid();
     return;
   }
@@ -3941,6 +3942,7 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
     TC.diagnose(attr->getLocation(),
                 diag::transposing_attr_result_value_not_differentiable,
                 expectedOriginalFnType);
+    D->getAttrs().removeAttribute(attr);
     attr->setInvalid();
     return;
   }
@@ -4028,8 +4030,6 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
       hasValidTypeContext, invalidTypeContextDiagnostic);
 
   if (!originalFn) {
-    // TODO(bartchr): removing attr shouldn't be necessary, but in testing
-    // printing the AST it sometimes prints.
     D->getAttrs().removeAttribute(attr);
     attr->setInvalid();
     return;
@@ -4051,6 +4051,7 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
           TC, originalFn, wrtParamIndices, wrtParamTypes,
           transpose->getGenericEnvironment(), transpose->getModuleContext(),
           parsedWrtParams, attr->getLocation())) {
+    D->getAttrs().removeAttribute(attr);
     attr->setInvalid();
     return;
   }
@@ -4088,6 +4089,7 @@ void AttributeChecker::visitTransposingAttr(TransposingAttr *attr) {
       TC.diagnose(originalFn->getLoc(),
                   diag::differentiating_attr_result_func_original_note,
                   originalFn->getFullName());
+    D->getAttrs().removeAttribute(attr);
     attr->setInvalid();
     return;
   }
