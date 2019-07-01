@@ -3034,7 +3034,7 @@ static AutoDiffIndexSubset *computeTransposingParameters(
 //        function, derivativeGenEnv);
   
   // Otherwise, build parameter indices from parsed differentiation parameters.
-  unsigned numParams = params.size() + transposeResultTypes.size() - 1 + wrtSelf;
+  unsigned numParams = params.size() + transposeResultTypes.size();
   auto paramIndices = SmallBitVector(numParams);
   int lastIndex = -1;
   for (unsigned i : indices(parsedWrtParams)) {
