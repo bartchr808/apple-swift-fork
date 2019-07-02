@@ -4744,11 +4744,12 @@ bool wrtSelf) {
   SmallVector<AnyFunctionType::Param, 8> originalParams;
   unsigned numberOriginalParameters =
       transposeParams.size() + wrtParams.size() - 1;
-  for (auto i : range(transposeResultTypesIndex, numberOriginalParameters + transposeResultTypesIndex)) {
+  for (auto i : range(numberOriginalParameters)) {
     // Need to check if it is the 'self' param since we handle it differently
     // above.
+    bool lookingAtSelf = (i == (wrtParamIndices->getCapacity() - 1)) && wrtSelf;
     bool isWrt = wrtParamIndices->contains(i);
-    if (isWrt) {
+    if (isWrt && !lookingAtSelf) {
       // If in WRT list, the item in the result tuple must be a parameter in the
       // original function.
       auto resultType = transposeResultTypes[transposeResultTypesIndex].getType();
@@ -4760,7 +4761,6 @@ bool wrtSelf) {
     } else {
       // Else if not in the WRT list, the parameter in the transposing function
       // is a parameter in the original function.
-      // TODO(bartchr): error!
       originalParams.push_back(transposeParams[transposeParamsIndex]);
       transposeParamsIndex++;
     }

@@ -3057,7 +3057,7 @@ static AutoDiffIndexSubset *computeTransposingParameters(
           TC.diagnose(paramLoc, diag::diff_params_clause_self_must_be_first);
           return nullptr;
         }
-        paramIndices.set(parsedWrtParams.size() - 1);
+        paramIndices.set(numParams - 1);
         break;
       }
       case ParsedAutoDiffParameter::Kind::Ordered: {

@@ -146,7 +146,7 @@ func tangentNotLast(t: Float, y: Int) -> Float {
 
 // ~~~~~~~~~~~~~ Test methods. ~~~~~~~~~~~~~
 
-// Method no parameters.
+// // Method no parameters.
 extension Float {
   func getDouble() -> Double {
       return Double(self)
@@ -254,9 +254,7 @@ extension Double {
   func threeParamsT6(s: Float) -> (Float, Double, Float) {
     return (s + Float(self), Double(s) + self, s + Float(self))
   }
-}
 
-extension Double {
   @transposing(Float.threeParams, wrt: self) 
   func threeParamsT6(_ x: Float, _ y: Double, _ z: Float) -> Float {
     return Float(self + y) + x
@@ -273,24 +271,47 @@ extension Double {
     return (Float(self) + x + z, self + Double(x + z))
   }
 
-  // @transposing(Float.threeParams, wrt: (self, 2)) 
-  // func threeParamsT9(_ x: Float, _ y: Double, _ t: Double) -> Float {
-  //   return Float(self) + Float(y + t) + x
-  // }
+  @transposing(Float.threeParams, wrt: (self, 2)) 
+  func threeParamsT9(_ x: Float, _ y: Double) -> (Float, Float) {
+    let ret = Float(self + y) + x
+    return (ret, ret)
+  }
 
-  // @transposing(Float.threeParams, wrt: (self, 0, 1)) 
-  // func threeParamsT10(_ z: Float, _ t: Double) -> (Float, Double) {
-  //   return (Float(self) + z + Float(t), self + Double(z) + t)
-  // }
+  @transposing(Float.threeParams, wrt: (self, 0, 1)) 
+  func threeParamsT10(_ z: Float) -> (Float, Float, Double) {
+    let retF = Float(self) + z
+    return (retF, retF, self + Double(z))
+  }
 
-  // @transposing(Float.threeParams, wrt: (self, 0, 2)) 
-  // func threeParamsT11(_ y: Double, _ t: Double) -> (Float, Float) {
-  //   let ret = Float(self) + Float(y + t)
-  //   return (ret, ret)
-  // }
+  @transposing(Float.threeParams, wrt: (self, 0, 2)) 
+  func threeParamsT11(_ y: Double) -> (Float, Float, Float) {
+    let ret = Float(self + y)
+    return (ret, ret, ret)
+  }
 
-  // @transposing(Float.threeParams, wrt: (self, 0, 1, 2)) 
-  // func threeParamsT12(_ t: Double) -> (Float, Double, Float) {
-  //   return (Float(self + t), self +  t, Float(self + t))
-  // }
+  @transposing(Float.threeParams, wrt: (self, 0, 1, 2)) 
+  func threeParamsT12() -> (Float, Float, Double, Float) {
+    return (Float(self), Float(self), self, Float(self))
+  }
+}
+
+// Nested struct
+struct level1 {
+  struct level2 {
+    func foo(x: Float) -> Float {
+      return x
+    }
+  }
+}
+
+extension Float {
+  @transposing(level1.level2.foo, wrt: 0)
+  func t(x: level1.level2) -> Float {
+    return self
+  }
+
+  @transposing(level1.level2.foo, wrt: (self, 0))
+  func t() -> (level1.level2, Float) {
+    return (level1.level2(), self)
+  }
 }
