@@ -5695,10 +5695,10 @@ private:
                                       SILLocation loc) {
     if (val.isConcrete()) {
       LLVM_DEBUG(getADDebugStream()
-          << "Materializing adjoint: Value is concrete.\n");
+          << "Materializing tangent: Value is concrete.\n");
       return val.getConcreteValue();
     }
-    LLVM_DEBUG(getADDebugStream() << "Materializing adjoint: Value is "
+    LLVM_DEBUG(getADDebugStream() << "Materializing tangent: Value is "
                                      "non-concrete. Materializing directly.\n");
     return materializeTangentDirect(val, loc);
   }
@@ -5955,9 +5955,9 @@ private:
       SILDeclRef declRef(combinerFuncDecl, SILDeclRef::Kind::Func);
       auto silFnTy = context.getTypeConverter().getConstantType(declRef);
       // %0 = witness_method @+
-      auto witnessMethod = diffBuilder.createWitnessMethod(loc, tangentASTTy,
-                                                           *confRef, declRef,
-                                                           silFnTy);
+      auto *witnessMethod = diffBuilder.createWitnessMethod(loc, tangentASTTy,
+                                                            *confRef, declRef,
+                                                            silFnTy);
       auto subMap = SubstitutionMap::getProtocolSubstitutions(
           proto, tangentASTTy, *confRef);
       // %1 = metatype $T.Type
@@ -6176,7 +6176,7 @@ private:
     assert(tangentValue.getType() ==
            getRemappedTangentType(originalValue->getType()));
     auto insertion =
-    tangentValueMap.try_emplace(originalValue, tangentValue);
+        tangentValueMap.try_emplace(originalValue, tangentValue);
     assert(insertion.second && "Tangent value inserted before");
   }
 
@@ -6533,6 +6533,8 @@ public:
 
     LLVM_DEBUG(getADDebugStream() << "Generated JVP for "
                << original->getName() << ":\n" << *jvp);
+    LLVM_DEBUG(getADDebugStream() << "Generated Differential for "
+               << original->getName() << ":\n" << differential);
     return errorOccurred;
   }
 
@@ -6833,7 +6835,8 @@ public:
     differentialValues[ai->getParent()].push_back(diffFunc);
 
     // Differential emission.
-    visitApplyInstDifferential(ai, indices);
+    if (shouldBeDifferentiated(ai, getIndices()))
+      visitApplyInstDifferential(ai, indices);
   }
 
   /// Handle `load` instruction.
@@ -6971,7 +6974,8 @@ public:
 
   void visitBeginAccessInst(BeginAccessInst *bai) {
     TypeSubstCloner::visitBeginAccessInst(bai);
-    visitBeginAccessInstDifferential(bai);
+    if (shouldBeDifferentiated(bai, getIndices()))
+      visitBeginAccessInstDifferential(bai);
   }
 
   void visitAutoDiffFunctionInst(AutoDiffFunctionInst *adfi) {
