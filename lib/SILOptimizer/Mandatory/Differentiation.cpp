@@ -5759,13 +5759,8 @@ private:
 
   ValueWithCleanup &getTangentBuffer(SILBasicBlock *origBB,
                                      SILValue originalBuffer) {
-    auto diffBuilder = getDifferentialBuilder();
     assert(originalBuffer->getType().isAddress());
     assert(originalBuffer->getFunction() == original);
-    auto insertion = bufferMap.try_emplace({origBB, originalBuffer},
-                                           ValueWithCleanup(SILValue()));
-    if (!insertion.second) // not inserted
-      return insertion.first->getSecond();
 
     // Diagnose `struct_element_addr` instructions to `@noDerivative` fields.
     if (auto *seai = dyn_cast<StructElementAddrInst>(originalBuffer)) {
@@ -5786,35 +5781,10 @@ private:
       return (bufferMap[{origBB, originalBuffer}] = projWithCleanup);
     }
 
-    // Set insertion point for local allocation builder: before the last local
-    // allocation, or at the start of the adjoint function's entry if no local
-    // allocations exist yet.
-    diffLocalAllocBuilder.setInsertionPoint(
-        getDifferential().getEntryBlock(),
-        getNextDifferentialLocalAllocationInsertionPoint());
-    // Allocate local buffer and initialize to zero.
-    auto *newBuf = diffLocalAllocBuilder.createAllocStack(
-        originalBuffer.getLoc(),
-        getRemappedTangentType(originalBuffer->getType()));
-    auto *access = diffLocalAllocBuilder.createBeginAccess(
-        newBuf->getLoc(), newBuf, SILAccessKind::Init,
-        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
-        /*fromBuiltin*/ false);
-    // Temporarily change global builder insertion point and emit zero into the
-    // local buffer.
-    auto insertionPoint = diffBuilder.getInsertionBB();
-    diffBuilder.setInsertionPoint(
-                              diffLocalAllocBuilder.getInsertionBB(),
-                              diffLocalAllocBuilder.getInsertionPoint());
-    emitZeroIndirect(access->getType().getASTType(), access, access->getLoc());
-    diffBuilder.setInsertionPoint(insertionPoint);
-    diffLocalAllocBuilder.createEndAccess(
-        access->getLoc(), access, /*aborted*/ false);
-    // Create cleanup for local buffer.
-    ValueWithCleanup bufWithCleanup(
-        newBuf, makeCleanup(newBuf, emitCleanup, {}));
-    differentialLocalAllocations.push_back(bufWithCleanup);
-    return (insertion.first->getSecond() = bufWithCleanup);
+     auto insertion = bufferMap.try_emplace({origBB, originalBuffer},
+                                            ValueWithCleanup(SILValue()));
+     assert(!insertion.second && "buffer map should have already been added.");
+     return insertion.first->getSecond();
   }
 
   // Accumulates `rhsBufferAccess` into the tangent buffer corresponding to
@@ -6265,7 +6235,8 @@ private:
           auto tanParamVal = diffBuilder.emitTupleExtract(
               loc, tangentTuple, tupleExtract->getFieldNo());
           tanParam =
-              ValueWithCleanup(tanParamVal, makeCleanup(tanParamVal, emitCleanup, {}));
+              ValueWithCleanup(tanParamVal, makeCleanup(tanParamVal,
+                                                        emitCleanup, {}));
         }
         // Otherwise, materialize adjoint value of `ai`.
         else {
@@ -6520,14 +6491,14 @@ public:
       }
       LLVM_DEBUG(getADDebugStream()
                  << "Assigned parameter " << *diffParam
-                 << " as the adjoint of original result " << origParam);
+                 << " as the tangent of original result " << *origParam);
     }
 
     // Clone
     SmallVector<SILValue, 4> entryArgs(entry->getArguments().begin(),
                                        entry->getArguments().end());
     cloneFunctionBody(original, entry, entryArgs);
-//    // If errors occurred, back out.
+    // If errors occurred, back out.
     if (errorOccurred)
       return true;
 
@@ -6552,7 +6523,7 @@ public:
       SILInstructionVisitor::visit(inst);
 
       LLVM_DEBUG({
-        auto &s = llvm::dbgs() << "[DF] Emitted:\n";
+        auto &s = llvm::dbgs() << "[DF] Emitted in Differential:\n";
         auto afterInsertion = diffBuilder.getInsertionPoint();
         for (auto it = ++beforeInsertion; it != afterInsertion; ++it)
           s << *it;
@@ -6841,38 +6812,21 @@ public:
 
   /// Handle `load` instruction.
   ///   Original: y = load x
-  ///    Tangent: tan[x] += tan[y]
+  ///    Tangent: tan[y] = load tan[x]
   void visitLoadInstDifferential(LoadInst *li) {
-    auto diffBuilder = getDifferentialBuilder();
     auto *bb = li->getParent();
-    auto adjVal = materializeTangentDirect(getTangentValue(li), li->getLoc());
-    // Allocate a local buffer and store the adjoint value. This buffer will be
-    // used for accumulation into the adjoint buffer.
-    auto *localBuf = diffBuilder.createAllocStack(li->getLoc(), adjVal.getType());
-    auto *initAccess = diffBuilder.createBeginAccess(
-        li->getLoc(), localBuf, SILAccessKind::Init,
-        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
-        /*fromBuiltin*/ false);
-    diffBuilder.createStore(li->getLoc(), adjVal, initAccess,
-                        getBufferSOQ(localBuf->getType().getASTType(),
-                                     getDifferential()));
-    diffBuilder.createEndAccess(li->getLoc(), initAccess, /*aborted*/ false);
-    // Get the adjoint buffer.
-    auto &adjBuf = getTangentBuffer(bb, li->getOperand());
-    if (errorOccurred)
-      return;
-    // Accumulate the adjoint value in the local buffer into the adjoint buffer.
-    auto *readAccess = diffBuilder.createBeginAccess(
-        li->getLoc(), localBuf, SILAccessKind::Read,
-        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
-        /*fromBuiltin*/ false);
-    accumulateIndirect(adjBuf, readAccess);
-    // Combine the adjoint buffer's original child cleanups with the adjoint
-    // value's cleanup.
-    adjBuf.setCleanup(makeCleanupFromChildren({adjBuf.getCleanup(),
-                                               adjVal.getCleanup()}));
-    diffBuilder.createEndAccess(li->getLoc(), readAccess, /*aborted*/ false);
-    diffBuilder.createDeallocStack(li->getLoc(), localBuf);
+    auto diffBuilder = getDifferentialBuilder();
+
+    auto tanValSrc = getTangentBuffer(bb, li->getOperand());
+    auto *tanValDest = diffBuilder.createLoad(li->getLoc(), tanValSrc,
+                           getBufferLOQ(li->getType().getASTType(),
+                                        getDifferential()));
+
+    auto valueCleanup = makeCleanup(tanValDest, emitCleanup,
+        tanValSrc.getCleanup()
+        ? tanValSrc.getCleanup()->getChildren() : ArrayRef<Cleanup *>());
+    addTangentValue(bb, li, makeConcreteTangentValue(
+        ValueWithCleanup(tanValDest, valueCleanup)));
   }
 
   void visitLoadInst(LoadInst *li) {
@@ -6883,29 +6837,19 @@ public:
 
   /// Handle `store` instruction in the differential.
   ///   Original: store x to y
-  ///    Tangent: tan[x] += load tan[y]; tan[y] = 0
+  ///    Tangent: store tan[x] to tan[y]
   void visitStoreInstDifferential(StoreInst *si) {
-    auto diffBuilder = getDifferentialBuilder();
-
     auto *bb = si->getParent();
-    auto &tanBuf = getTangentBuffer(bb, si->getDest());
-    if (errorOccurred)
-      return;
-    auto bufType = remapType(tanBuf.getType());
-    auto tanVal = diffBuilder.createLoad(si->getLoc(), tanBuf,
-                                         getBufferLOQ(bufType.getASTType(),
+    auto &diffBuilder = getDifferentialBuilder();
+
+    auto tanValSrc = materializeTangent(getTangentValue(si->getSrc()),
+                                        si->getLoc());
+    auto tanValDest = getTangentBuffer(bb, si->getDest());
+
+    diffBuilder.createStore(si->getLoc(), tanValSrc, tanValDest,
+                            getBufferSOQ(tanValDest.getType().getASTType(),
                                          getDifferential()));
-    // Disable the buffer's top-level cleanup (which is supposed to operate on
-    // the buffer), create a cleanup for the value that carries all child
-    // cleanups.
-    auto valueCleanup = makeCleanup(tanVal, emitCleanup,
-                                    tanBuf.getCleanup()
-                                        ? tanBuf.getCleanup()->getChildren()
-                                        : ArrayRef<Cleanup *>());
-    addTangentValue(bb, si->getSrc(), makeConcreteTangentValue(
-        ValueWithCleanup(tanVal, valueCleanup)));
-    // Set the buffer to zero, with a cleanup.
-    emitZeroIndirect(bufType.getASTType(), tanBuf, si->getLoc());
+
   }
 
   void visitStoreInst(StoreInst *si) {
@@ -6916,13 +6860,14 @@ public:
 
   /// Handle `copy_addr` instruction.
   ///   Original: copy_addr x to y
-  ///    Tangent: tan[x] += tan[y]; tan[y] = 0
+  ///    Tangent: copy_addr tan[x] to tan[y]
   void visitCopyAddrInstDifferential(CopyAddrInst *cai) {
     auto diffBuilder = getDifferentialBuilder();
     auto *bb = cai->getParent();
     auto &adjDest = getTangentBuffer(bb, cai->getDest());
     if (errorOccurred)
       return;
+
     auto destType = remapType(adjDest.getType());
     // Disable the buffer's top-level cleanup (which is supposed to operate on
     // the buffer), create a cleanup for the value that carrys all child
@@ -6979,6 +6924,35 @@ public:
     TypeSubstCloner::visitBeginAccessInst(bai);
     if (shouldBeDifferentiated(bai, getIndices()))
       visitBeginAccessInstDifferential(bai);
+  }
+
+  // Add the mapping and emit the same instruction
+  void visitAllocStackInstDifferential(AllocStackInst *asi) {
+    auto &diffBuilder = getDifferentialBuilder();
+
+    auto *mappedAllocStackInst =
+        diffBuilder.createAllocStack(
+            asi->getLoc(), getRemappedTangentType(asi->getElementType()));
+    bufferMap.try_emplace({asi->getParent(), asi},
+                          mappedAllocStackInst);
+  }
+
+  void visitAllocStackInst(AllocStackInst *asi) {
+    TypeSubstCloner::visitAllocStackInst(asi);
+    if (shouldBeDifferentiated(asi, getIndices()))
+      visitAllocStackInstDifferential(asi);
+  }
+
+  void visitDeallocStackInstDifferential(DeallocStackInst *dsi) {
+    auto &diffBuilder = getDifferentialBuilder();
+    auto tanBuffer = getTangentBuffer(dsi->getParent(), dsi->getOperand());
+    diffBuilder.createDeallocStack(dsi->getLoc(), tanBuffer);
+  }
+
+  void visitDeallocStackInst(DeallocStackInst *dsi) {
+    TypeSubstCloner::visitDeallocStackInst(dsi);
+    if (shouldBeDifferentiated(dsi, getIndices()))
+      visitDeallocStackInstDifferential(dsi);
   }
 
   void visitAutoDiffFunctionInst(AutoDiffFunctionInst *adfi) {
