@@ -5819,24 +5819,24 @@ private:
 
   // Accumulates `rhsBufferAccess` into the tangent buffer corresponding to
   // `originalBuffer`.
-//  void addToTangentBuffer(SILBasicBlock *origBB, SILValue originalBuffer,
-//  SILValue rhsBufferAccess) {
-//    auto diffBuilder = getDifferentialBuilder();
-//    assert(originalBuffer->getType().isAddress() &&
-//           rhsBufferAccess->getType().isAddress());
-//    assert(originalBuffer->getFunction() == original);
-//    assert(rhsBufferAccess->getFunction() == &getDifferential());
-//    auto adjointBuffer = getTangentBuffer(origBB, originalBuffer);
-//    if (errorOccurred)
-//      return;
-//    auto *destAccess = diffBuilder.createBeginAccess(
-//        rhsBufferAccess.getLoc(), adjointBuffer, SILAccessKind::Modify,
-//        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
-//        /*fromBuiltin*/ false);
-//    accumulateIndirect(destAccess, rhsBufferAccess);
-//    diffBuilder.createEndAccess(
-//        destAccess->getLoc(), destAccess, /*aborted*/ false);
-//  }
+  void addToTangentBuffer(SILBasicBlock *origBB, SILValue originalBuffer,
+                          SILValue rhsBufferAccess) {
+    auto diffBuilder = getDifferentialBuilder();
+    assert(originalBuffer->getType().isAddress() &&
+           rhsBufferAccess->getType().isAddress());
+    assert(originalBuffer->getFunction() == original);
+    assert(rhsBufferAccess->getFunction() == &getDifferential());
+    auto adjointBuffer = getTangentBuffer(origBB, originalBuffer);
+    if (errorOccurred)
+      return;
+    auto *destAccess = diffBuilder.createBeginAccess(
+        rhsBufferAccess.getLoc(), adjointBuffer, SILAccessKind::Modify,
+        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
+        /*fromBuiltin*/ false);
+    accumulateIndirect(destAccess, rhsBufferAccess);
+    diffBuilder.createEndAccess(
+        destAccess->getLoc(), destAccess, /*aborted*/ false);
+  }
 
   //--------------------------------------------------------------------------//
   // Type transformer
@@ -5864,65 +5864,65 @@ private:
     return AdjointValue::createAggregate(allocator, remapType(type), elements);
   }
 
-//  void accumulateIndirect(SILValue lhsDestAccess,
-//                          SILValue rhsAccess) {
-//    auto diffBuilder = getDifferentialBuilder();
-//    assert(lhsDestAccess->getType().isAddress() &&
-//           rhsAccess->getType().isAddress());
-//    assert(lhsDestAccess->getFunction() == &getDifferential());
-//    assert(rhsAccess->getFunction() == &getDifferential());
-//    auto loc = lhsDestAccess.getLoc();
-//    auto type = lhsDestAccess->getType();
-//    auto astType = type.getASTType();
-//    auto *swiftMod = getModule().getSwiftModule();
-//    auto tangentSpace = astType->getAutoDiffAssociatedTangentSpace(
-//        LookUpConformanceInModule(swiftMod));
-//    assert(tangentSpace && "No tangent space for this type");
-//    switch (tangentSpace->getKind()) {
-//    case VectorSpace::Kind::Vector: {
-//      auto *proto = context.getAdditiveArithmeticProtocol();
-//      auto *accumulatorFuncDecl = context.getPlusEqualDecl();
-//      // Call the combiner function and return.
-//      auto confRef = swiftMod->lookupConformance(astType, proto);
-//      assert(confRef.hasValue()
-//             && "Missing conformance to `AdditiveArithmetic`");
-//      SILDeclRef declRef(accumulatorFuncDecl, SILDeclRef::Kind::Func);
-//      auto silFnTy = context.getTypeConverter().getConstantType(declRef);
-//      // %0 = witness_method @+=
-//      auto witnessMethod =
-//          diffBuilder.createWitnessMethod(loc, astType, *confRef, declRef,
-//                                          silFnTy);
-//      auto subMap =
-//          SubstitutionMap::getProtocolSubstitutions(proto, astType, *confRef);
-//      // %1 = metatype $T.Type
-//      auto metatypeType =
-//          CanMetatypeType::get(astType, MetatypeRepresentation::Thick);
-//      auto metatypeSILType = SILType::getPrimitiveObjectType(metatypeType);
-//      auto metatype = diffBuilder.createMetatype(loc, metatypeSILType);
-//      // %2 = apply $0(%lhs, %rhs, %1)
-//      diffBuilder.createApply(loc, witnessMethod, subMap,
-//                              {lhsDestAccess, rhsAccess, metatype},
-//                              /*isNonThrowing*/ false);
-//      return;
-//    }
-//    case VectorSpace::Kind::Tuple: {
-//      auto tupleType = tangentSpace->getTuple();
-//      for (unsigned i : range(tupleType->getNumElements())) {
-//        auto *destAddr =
-//            diffBuilder.createTupleElementAddr(loc, lhsDestAccess, i);
-//        auto *eltAddrRHS =
-//            diffBuilder.createTupleElementAddr(loc, rhsAccess, i);
-//        accumulateIndirect(destAddr, eltAddrRHS);
-//      }
-//      return;
-//    }
-//    case VectorSpace::Kind::Function: {
-//      llvm_unreachable(
-//          "Unimplemented: Emit thunks for abstracting adjoint value "
-//          "accumulation");
-//    }
-//    }
-//  }
+  void accumulateIndirect(SILValue lhsDestAccess,
+                          SILValue rhsAccess) {
+    auto diffBuilder = getDifferentialBuilder();
+    assert(lhsDestAccess->getType().isAddress() &&
+           rhsAccess->getType().isAddress());
+    assert(lhsDestAccess->getFunction() == &getDifferential());
+    assert(rhsAccess->getFunction() == &getDifferential());
+    auto loc = lhsDestAccess.getLoc();
+    auto type = lhsDestAccess->getType();
+    auto astType = type.getASTType();
+    auto *swiftMod = getModule().getSwiftModule();
+    auto tangentSpace = astType->getAutoDiffAssociatedTangentSpace(
+        LookUpConformanceInModule(swiftMod));
+    assert(tangentSpace && "No tangent space for this type");
+    switch (tangentSpace->getKind()) {
+    case VectorSpace::Kind::Vector: {
+      auto *proto = context.getAdditiveArithmeticProtocol();
+      auto *accumulatorFuncDecl = context.getPlusEqualDecl();
+      // Call the combiner function and return.
+      auto confRef = swiftMod->lookupConformance(astType, proto);
+      assert(confRef.hasValue()
+             && "Missing conformance to `AdditiveArithmetic`");
+      SILDeclRef declRef(accumulatorFuncDecl, SILDeclRef::Kind::Func);
+      auto silFnTy = context.getTypeConverter().getConstantType(declRef);
+      // %0 = witness_method @+=
+      auto witnessMethod =
+          diffBuilder.createWitnessMethod(loc, astType, *confRef, declRef,
+                                          silFnTy);
+      auto subMap =
+          SubstitutionMap::getProtocolSubstitutions(proto, astType, *confRef);
+      // %1 = metatype $T.Type
+      auto metatypeType =
+          CanMetatypeType::get(astType, MetatypeRepresentation::Thick);
+      auto metatypeSILType = SILType::getPrimitiveObjectType(metatypeType);
+      auto metatype = diffBuilder.createMetatype(loc, metatypeSILType);
+      // %2 = apply $0(%lhs, %rhs, %1)
+      diffBuilder.createApply(loc, witnessMethod, subMap,
+                              {lhsDestAccess, rhsAccess, metatype},
+                              /*isNonThrowing*/ false);
+      return;
+    }
+    case VectorSpace::Kind::Tuple: {
+      auto tupleType = tangentSpace->getTuple();
+      for (unsigned i : range(tupleType->getNumElements())) {
+        auto *destAddr =
+            diffBuilder.createTupleElementAddr(loc, lhsDestAccess, i);
+        auto *eltAddrRHS =
+            diffBuilder.createTupleElementAddr(loc, rhsAccess, i);
+        accumulateIndirect(destAddr, eltAddrRHS);
+      }
+      return;
+    }
+    case VectorSpace::Kind::Function: {
+      llvm_unreachable(
+          "Unimplemented: Emit thunks for abstracting adjoint value "
+          "accumulation");
+    }
+    }
+  }
 
   void accumulateIndirect(
       SILValue resultBufAccess, SILValue lhsBufAccess, SILValue rhsBufAccess) {
@@ -6842,109 +6842,112 @@ public:
   /// Handle `load` instruction.
   ///   Original: y = load x
   ///    Tangent: tan[x] += tan[y]
-//  void visitLoadInstDifferential(LoadInst *li) {
-//    auto diffBuilder = getDifferentialBuilder();
-//    auto *bb = li->getParent();
-//    auto adjVal = materializeTangentDirect(getTangentValue(li), li->getLoc());
-//    // Allocate a local buffer and store the adjoint value. This buffer will be
-//    // used for accumulation into the adjoint buffer.
-//    auto *localBuf = diffBuilder.createAllocStack(li->getLoc(), adjVal.getType());
-//    auto *initAccess = diffBuilder.createBeginAccess(
-//        li->getLoc(), localBuf, SILAccessKind::Init,
-//        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
-//        /*fromBuiltin*/ false);
-//    diffBuilder.createStore(li->getLoc(), adjVal, initAccess,
-//                        getBufferSOQ(localBuf->getType().getASTType(),
-//                                     getDifferential()));
-//    diffBuilder.createEndAccess(li->getLoc(), initAccess, /*aborted*/ false);
-//    // Get the adjoint buffer.
-//    auto &adjBuf = getTangentBuffer(bb, li->getOperand());
-//    if (errorOccurred)
-//      return;
-//    // Accumulate the adjoint value in the local buffer into the adjoint buffer.
-//    auto *readAccess = diffBuilder.createBeginAccess(
-//        li->getLoc(), localBuf, SILAccessKind::Read,
-//        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
-//        /*fromBuiltin*/ false);
-//    accumulateIndirect(adjBuf, readAccess);
-//    // Combine the adjoint buffer's original child cleanups with the adjoint
-//    // value's cleanup.
-//    adjBuf.setCleanup(makeCleanupFromChildren({adjBuf.getCleanup(),
-//                                               adjVal.getCleanup()}));
-//    diffBuilder.createEndAccess(li->getLoc(), readAccess, /*aborted*/ false);
-//    diffBuilder.createDeallocStack(li->getLoc(), localBuf);
-//  }
+  void visitLoadInstDifferential(LoadInst *li) {
+    auto diffBuilder = getDifferentialBuilder();
+    auto *bb = li->getParent();
+    auto adjVal = materializeTangentDirect(getTangentValue(li), li->getLoc());
+    // Allocate a local buffer and store the adjoint value. This buffer will be
+    // used for accumulation into the adjoint buffer.
+    auto *localBuf = diffBuilder.createAllocStack(li->getLoc(), adjVal.getType());
+    auto *initAccess = diffBuilder.createBeginAccess(
+        li->getLoc(), localBuf, SILAccessKind::Init,
+        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
+        /*fromBuiltin*/ false);
+    diffBuilder.createStore(li->getLoc(), adjVal, initAccess,
+                        getBufferSOQ(localBuf->getType().getASTType(),
+                                     getDifferential()));
+    diffBuilder.createEndAccess(li->getLoc(), initAccess, /*aborted*/ false);
+    // Get the adjoint buffer.
+    auto &adjBuf = getTangentBuffer(bb, li->getOperand());
+    if (errorOccurred)
+      return;
+    // Accumulate the adjoint value in the local buffer into the adjoint buffer.
+    auto *readAccess = diffBuilder.createBeginAccess(
+        li->getLoc(), localBuf, SILAccessKind::Read,
+        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
+        /*fromBuiltin*/ false);
+    accumulateIndirect(adjBuf, readAccess);
+    // Combine the adjoint buffer's original child cleanups with the adjoint
+    // value's cleanup.
+    adjBuf.setCleanup(makeCleanupFromChildren({adjBuf.getCleanup(),
+                                               adjVal.getCleanup()}));
+    diffBuilder.createEndAccess(li->getLoc(), readAccess, /*aborted*/ false);
+    diffBuilder.createDeallocStack(li->getLoc(), localBuf);
+  }
 
-//  void visitLoadInst(LoadInst *li) {
-//    TypeSubstCloner::visitLoadInst(li);
-//    visitLoadInstDifferential(li);
-//  }
+  void visitLoadInst(LoadInst *li) {
+    TypeSubstCloner::visitLoadInst(li);
+    if (shouldBeDifferentiated(li, getIndices()))
+      visitLoadInstDifferential(li);
+  }
 
   /// Handle `store` instruction in the differential.
   ///   Original: store x to y
   ///    Tangent: tan[x] += load tan[y]; tan[y] = 0
-//  void visitStoreInstDifferential(StoreInst *si) {
-//    auto diffBuilder = getDifferentialBuilder();
-//
-//    auto *bb = si->getParent();
-//    auto &tanBuf = getTangentBuffer(bb, si->getDest());
-//    if (errorOccurred)
-//      return;
-//    auto bufType = remapType(tanBuf.getType());
-//    auto tanVal = diffBuilder.createLoad(si->getLoc(), tanBuf,
-//                                         getBufferLOQ(bufType.getASTType(),
-//                                         getDifferential()));
-//    // Disable the buffer's top-level cleanup (which is supposed to operate on
-//    // the buffer), create a cleanup for the value that carries all child
-//    // cleanups.
-//    auto valueCleanup = makeCleanup(tanVal, emitCleanup,
-//                                    tanBuf.getCleanup()
-//                                        ? tanBuf.getCleanup()->getChildren()
-//                                        : ArrayRef<Cleanup *>());
-//    addTangentValue(bb, si->getSrc(), makeConcreteTangentValue(
-//        ValueWithCleanup(tanVal, valueCleanup)));
-//    // Set the buffer to zero, with a cleanup.
-//    emitZeroIndirect(bufType.getASTType(), tanBuf, si->getLoc());
-//  }
+  void visitStoreInstDifferential(StoreInst *si) {
+    auto diffBuilder = getDifferentialBuilder();
 
-//  void visitStoreInst(StoreInst *si) {
-//    TypeSubstCloner::visitStoreInst(si);
-//    visitStoreInstDifferential(si);
-//  }
+    auto *bb = si->getParent();
+    auto &tanBuf = getTangentBuffer(bb, si->getDest());
+    if (errorOccurred)
+      return;
+    auto bufType = remapType(tanBuf.getType());
+    auto tanVal = diffBuilder.createLoad(si->getLoc(), tanBuf,
+                                         getBufferLOQ(bufType.getASTType(),
+                                         getDifferential()));
+    // Disable the buffer's top-level cleanup (which is supposed to operate on
+    // the buffer), create a cleanup for the value that carries all child
+    // cleanups.
+    auto valueCleanup = makeCleanup(tanVal, emitCleanup,
+                                    tanBuf.getCleanup()
+                                        ? tanBuf.getCleanup()->getChildren()
+                                        : ArrayRef<Cleanup *>());
+    addTangentValue(bb, si->getSrc(), makeConcreteTangentValue(
+        ValueWithCleanup(tanVal, valueCleanup)));
+    // Set the buffer to zero, with a cleanup.
+    emitZeroIndirect(bufType.getASTType(), tanBuf, si->getLoc());
+  }
+
+  void visitStoreInst(StoreInst *si) {
+    TypeSubstCloner::visitStoreInst(si);
+    if (shouldBeDifferentiated(si, getIndices()))
+      visitStoreInstDifferential(si);
+  }
 
   /// Handle `copy_addr` instruction.
   ///   Original: copy_addr x to y
   ///    Tangent: tan[x] += tan[y]; tan[y] = 0
-//  void visitCopyAddrInstDifferential(CopyAddrInst *cai) {
-//    auto diffBuilder = getDifferentialBuilder();
-//    auto *bb = cai->getParent();
-//    auto &adjDest = getTangentBuffer(bb, cai->getDest());
-//    if (errorOccurred)
-//      return;
-//    auto destType = remapType(adjDest.getType());
-//    // Disable the buffer's top-level cleanup (which is supposed to operate on
-//    // the buffer), create a cleanup for the value that carrys all child
-//    // cleanups.
-//    auto valueCleanup = makeCleanup(adjDest, emitCleanup,
-//        adjDest.getCleanup()
-//            ? adjDest.getCleanup()->getChildren() : ArrayRef<Cleanup *>());
-//    adjDest.setCleanup(valueCleanup);
-//    auto *readAccess = diffBuilder.createBeginAccess(
-//        cai->getLoc(), adjDest, SILAccessKind::Read,
-//        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
-//        /*fromBuiltin*/ false);
-//    addToTangentBuffer(bb, cai->getSrc(), readAccess);
-//    diffBuilder.createEndAccess(cai->getLoc(), readAccess, /*aborted*/ false);
-//    // Set the buffer to zero, with a cleanup.
-//    emitZeroIndirect(destType.getASTType(), adjDest, cai->getLoc());
-//    auto cleanup = makeCleanup(adjDest, emitCleanup, {});
-//    adjDest.setCleanup(cleanup);
-//  }
+  void visitCopyAddrInstDifferential(CopyAddrInst *cai) {
+    auto diffBuilder = getDifferentialBuilder();
+    auto *bb = cai->getParent();
+    auto &adjDest = getTangentBuffer(bb, cai->getDest());
+    if (errorOccurred)
+      return;
+    auto destType = remapType(adjDest.getType());
+    // Disable the buffer's top-level cleanup (which is supposed to operate on
+    // the buffer), create a cleanup for the value that carrys all child
+    // cleanups.
+    auto valueCleanup = makeCleanup(adjDest, emitCleanup,
+        adjDest.getCleanup()
+            ? adjDest.getCleanup()->getChildren() : ArrayRef<Cleanup *>());
+    adjDest.setCleanup(valueCleanup);
+    auto *readAccess = diffBuilder.createBeginAccess(
+        cai->getLoc(), adjDest, SILAccessKind::Read,
+        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
+        /*fromBuiltin*/ false);
+    addToTangentBuffer(bb, cai->getSrc(), readAccess);
+    diffBuilder.createEndAccess(cai->getLoc(), readAccess, /*aborted*/ false);
+    // Set the buffer to zero, with a cleanup.
+    emitZeroIndirect(destType.getASTType(), adjDest, cai->getLoc());
+    auto cleanup = makeCleanup(adjDest, emitCleanup, {});
+    adjDest.setCleanup(cleanup);
+  }
 
-//  void visitCopyAddrInst(CopyAddrInst *cai) {
-//    TypeSubstCloner::visitCopyAddrInst(cai);
-//    visitCopyAddrInstDifferential(cai);
-//  }
+  void visitCopyAddrInst(CopyAddrInst *cai) {
+    TypeSubstCloner::visitCopyAddrInst(cai);
+    if (shouldBeDifferentiated(cai, getIndices()))
+      visitCopyAddrInstDifferential(cai);
+  }
 
   /// Handle `begin_access` instruction.
   ///   Original: y = begin_access x
