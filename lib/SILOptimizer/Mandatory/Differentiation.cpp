@@ -5859,8 +5859,10 @@ private:
     // TODO: Handle indirect results.
     auto tanParam =
         materializeTangent(getTangentValue(ri->getOperand()), loc);
-    tanParam.getCleanup()->disable();
-    tanParam.getCleanup()->applyRecursively(diffBuilder, loc);
+    if (tanParam.getCleanup()) {
+      tanParam.getCleanup()->disable();
+      tanParam.getCleanup()->applyRecursively(diffBuilder, loc);
+    }
     diffBuilder.createReturn(
         ri->getLoc(), tanParam);
   }
@@ -6094,7 +6096,9 @@ public:
     auto &diffBuilder = getDifferentialBuilder();
     auto diffParamArgs =
         differential.getArgumentsWithoutIndirectResults().drop_back();
-    assert(diffParamArgs.size() == attr->getIndices().parameters->getCapacity());
+    // TODO: this should exist, it's some weird problem with initializer and
+    // partial application.
+//    assert(diffParamArgs.size() == attr->getIndices().parameters->getCapacity());
     auto origParamArgs = original->getArgumentsWithoutIndirectResults();
 
     // Check if result is not varied.

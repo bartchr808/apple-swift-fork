@@ -34,4 +34,21 @@ ForwardModeTests.test("BinaryWithLets") {
   expectEqual(-19, differential(1, 1))
 }
 
+ForwardModeTests.test("UnaryWithVars") {
+  @differentiable
+  @_silgen_name("unary")
+  func unary(x: Float) -> Float {
+    var a = x
+    var b = a + 1
+    var c: Float = 2
+    var d = a + b + c
+    d = d + d
+    return d
+  }
+
+  let (y, differential) = valueWithDifferential(at: 4, in: unary)
+  expectEqual(22, y)
+  expectEqual(4, differential(1))
+}
+
 runAllTests()
