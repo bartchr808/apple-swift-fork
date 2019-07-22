@@ -1,3 +1,4 @@
+
 //===--- Differentiation.cpp - SIL Automatic Differentiation --*- C++ -*---===//
 //
 // This source file is part of the Swift.org open source project
@@ -5952,6 +5953,66 @@ private:
     //      ;
   }
 
+  /// Handle `struct_extract` instruction.
+  ///   Original: y = struct_extract x, #field
+  ///    Tangent: tan[y] = struct_extract tan[x], tan[#field]]
+  ///                   ^~~~~~~
+  ///                 field in tangent space corresponding to #field
+  void visitStructExtractInstDifferential(StructExtractInst *sei) {
+    assert(!sei->getField()->getAttrs().hasAttribute<NoDerivativeAttr>() &&
+           "`struct_extract` with `@noDerivative` field should not be "
+           "differentiated; activity analysis should not marked as varied");
+
+    auto diffBuilder = getDifferentialBuilder();
+    auto structTy = remapType(sei->getOperand()->getType()).getASTType();
+    auto tangentVectorTy =
+        getTangentSpace(structTy)->getType()->getCanonicalType();
+    assert(!getModule().Types.getTypeLowering(
+               tangentVectorTy, ResilienceExpansion::Minimal)
+                   .isAddressOnly());
+    auto *tangentVectorDecl =
+        tangentVectorTy->getStructOrBoundGenericStruct();
+    assert(tangentVectorDecl);
+
+    // Get the tangent of the field and create the extract inst in the SIL
+    // of the differential.
+    // Find the corresponding field in the tangent space.
+    VarDecl *tanField = nullptr;
+    // If the tangent space is the original struct, then field is the same.
+    if (tangentVectorDecl == sei->getStructDecl())
+      tanField = sei->getField();
+    // Otherwise, look up the field by name.
+    else {
+      auto tanFieldLookup =
+      tangentVectorDecl->lookupDirect(sei->getField()->getName());
+      if (tanFieldLookup.empty()) {
+        context.emitNondifferentiabilityError(
+            sei, invoker,
+            diag::autodiff_stored_property_no_corresponding_tangent,
+            sei->getStructDecl()->getNameStr(),
+            sei->getField()->getNameStr());
+        errorOccurred = true;
+        return;
+      }
+      tanField = cast<VarDecl>(tanFieldLookup.front());
+    }
+
+    // Get the Tangent of the operand (the struct)
+    auto tanOperand =
+        materializeTangent(getTangentValue(sei->getOperand()), sei->getLoc());
+
+    // Emit the instruction
+    auto tangentExtractInst =
+        diffBuilder.createStructExtract(sei->getLoc(), tanOperand, tanField);
+
+    // Add tangent for original result into value mapping.
+    auto tangentResult =  makeConcreteTangentValue(
+        ValueWithCleanup(tangentExtractInst,
+        // TODO: Consider if cleanup children are to be passed.
+        makeCleanup(tangentExtractInst, emitCleanup, {})));
+    addTangentValue(sei->getParent(), sei, tangentResult);
+  }
+
 public:
   explicit JVPEmitter(ADContext &context, SILFunction *original,
                       SILDifferentiableAttr *attr, SILFunction *jvp,
@@ -6615,6 +6676,12 @@ public:
     TypeSubstCloner::visitDeallocStackInst(dsi);
     if (shouldBeDifferentiated(dsi, getIndices()))
       visitDeallocStackInstDifferential(dsi);
+  }
+
+  void visitStructExtractInst(StructExtractInst *sei) {
+    TypeSubstCloner::visitStructExtractInst(sei);
+    if (shouldBeDifferentiated(sei, getIndices()))
+      visitStructExtractInstDifferential(sei);
   }
 
   void visitAutoDiffFunctionInst(AutoDiffFunctionInst *adfi) {
