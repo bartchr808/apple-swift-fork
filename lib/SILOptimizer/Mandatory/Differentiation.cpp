@@ -12,7 +12,7 @@
 //
 // SWIFT_ENABLE_TENSORFLOW
 //
-// This file implements reverse-mode automatic differentiation.
+// This file implements automatic differentiation.
 //
 // NOTE: Although the AD feature is developed as part of the Swift for
 // TensorFlow project, it is completely independent from TensorFlow support.
@@ -3810,6 +3810,12 @@ private:
       return activityInfo.isActive(val, indices);
     }))
       return true;
+    // Anything with an an active argument should be differentiated
+    // (i.e. `return %0`).
+    if (llvm::any_of(inst->getAllOperands(), [&](Operand &val) {
+      return activityInfo.isActive(val.get(), indices);
+    }))
+      return true;
     if (auto *ai = dyn_cast<ApplyInst>(inst)) {
       // Function applications with an active indirect result should be
       // differentiated.
@@ -4201,7 +4207,7 @@ private:
   /// Handle `struct_extract` instruction.
   ///   Original: y = struct_extract x, #field
   ///    Tangent: tan[y] = struct_extract tan[x], tan[#field]]
-  ///                   ^~~~~~~
+  ///                             ^~~~~~~
   ///                 field in tangent space corresponding to #field
   void visitStructExtractInstDifferential(StructExtractInst *sei) {
     assert(!sei->getField()->getAttrs().hasAttribute<NoDerivativeAttr>() &&
@@ -4302,11 +4308,10 @@ private:
     setTangentBuffer(bb, cai->getSrc(), readAccess);
     diffBuilder.createEndAccess(cai->getLoc(), readAccess, /*aborted*/ false);
   }
-  
 
   /// Handle `begin_access` instruction.
   ///   Original: y = begin_access x
-  ///    Tangent: nothing (differentiability checks, cleanup propagation)
+  ///    Tangent: nothing (differentiability checks)
   void visitBeginAccessInstDifferential(BeginAccessInst *bai) {
     // Check for non-differentiable writes.
     if (bai->getAccessKind() == SILAccessKind::Modify) {
@@ -4323,13 +4328,9 @@ private:
         return;
       }
     }
-    auto *bb = bai->getParent();
-    // TODO: finish this off.
-//    auto accessBuf = getTangentBuffer(bb, bai);
-//    auto &sourceBuf = getTangentBuffer(bb, bai->getSource());
   }
 
-  // Add the mapping and emit the same instruction
+  /// Add the value mapping and emit the same instruction.
   void visitAllocStackInstDifferential(AllocStackInst *asi) {
     auto &diffBuilder = getDifferentialBuilder();
 
@@ -4340,6 +4341,7 @@ private:
                           mappedAllocStackInst);
   }
 
+  /// Emit the same instruction but on the tangent instead.
   void visitDeallocStackInstDifferential(DeallocStackInst *dsi) {
     auto &diffBuilder = getDifferentialBuilder();
     auto tanBuffer = getTangentBuffer(dsi->getParent(), dsi->getOperand());
@@ -4350,12 +4352,12 @@ private:
     auto diffBuilder = getDifferentialBuilder();
     auto *bb = si->getParent();
     auto loc = si->getLoc();
-    // TODO: any way to just get the array of elements
-    SmallVector<SILValue, 4> elements;
+    SmallVector<SILValue, 4> tangentElements;
     for (auto elem : si->getElements())
-      elements.push_back(getTangentValue(elem).getConcreteValue());
+      tangentElements.push_back(getTangentValue(elem).getConcreteValue());
 
-    auto tanExtract = diffBuilder.createStruct(loc, si->getType(), elements);
+    auto tanExtract = diffBuilder.createStruct(loc, si->getType(),
+                                               tangentElements);
 
     addTangentValue(bb, si, makeConcreteTangentValue(tanExtract));
   }
@@ -4505,9 +4507,7 @@ public:
     auto &diffBuilder = getDifferentialBuilder();
     auto diffParamArgs =
         differential.getArgumentsWithoutIndirectResults().drop_back();
-    // TODO: this should exist, it's some weird problem with initializer and
-    // partial application.
-//    assert(diffParamArgs.size() == attr->getIndices().parameters->getCapacity());
+    assert(diffParamArgs.size() == attr->getIndices().parameters->getNumIndices());
     auto origParamArgs = original->getArgumentsWithoutIndirectResults();
 
     // Check if result is not varied.
@@ -4865,8 +4865,8 @@ public:
         ri->getLoc(), joinElements(directResults, builder, loc));
 
     // Differential emission.
-    // TODO: should be calling 'shouldBeDifferentiated'. If shouldn't be differentiated, then return 0.
-    visitReturnInstDifferential(ri);
+    if (shouldBeDifferentiated(ri, getIndices()))
+      visitReturnInstDifferential(ri);
   }
 
   void visitLoadInst(LoadInst *li) {
@@ -5590,7 +5590,7 @@ public:
         auto enumLoweredTy =
             getPullbackInfo().getLinearMapEnumLoweredType(succBB);
         auto *enumEltDecl =
-        getPullbackInfo().lookUpLinearMapEnumElement(origBB, succBB);
+            getPullbackInfo().lookUpLinearMapEnumElement(origBB, succBB);
         auto enumEltType = remapType(
             enumLoweredTy.getEnumElementType(enumEltDecl, getModule()));
         pullbackTrampolineBB->createPhiArgument(enumEltType,
@@ -5678,7 +5678,7 @@ public:
       // 1. Get the pullback struct pullback block argument.
       // 2. Extract the predecessor enum value from the pullback struct value.
       auto *pbStructVal = getPullbackBlockPullbackStructArgument(bb);
-      auto *predEnum = getPullbackInfo(). getLinearMapEnum(bb);
+      auto *predEnum = getPullbackInfo().getLinearMapEnum(bb);
       auto *predEnumField =
       getPullbackInfo().lookUpLinearMapStructEnumField(bb);
       auto *predEnumVal =
@@ -6137,10 +6137,10 @@ public:
     auto *pullbackCall = builder.createApply(
         loc, pullback, SubstitutionMap(), args, /*isNonThrowing*/ false);
 
-    // Extract all results from `pullbackCall`.
+    // Extract all direct results from the pullback.
     SmallVector<SILValue, 8> dirResults;
     extractAllElements(pullbackCall, builder, dirResults);
-    // Get all results in type-defined order.
+    // Get all pullback results in type-defined order.
     SmallVector<SILValue, 8> allResults;
     collectAllActualResultsInTypeOrder(
         pullbackCall, dirResults, pullbackCall->getIndirectSILResults(),
