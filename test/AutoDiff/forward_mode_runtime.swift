@@ -35,13 +35,13 @@ ForwardModeTests.test("BinaryWithLets") {
 }
 
 ForwardModeTests.test("UnaryWithVars") {
-  @differentiable
-  @_silgen_name("unary")
   func unary(x: Float) -> Float {
     var a = x
-    var b = a + 1
-    var c: Float = 2
-    var d = a + b + c
+    a = x
+    var b = a + 2
+    b = b - 1
+    var c: Float = 3
+    var d = a + b + c - 1
     d = d + d
     return d
   }
@@ -49,6 +49,43 @@ ForwardModeTests.test("UnaryWithVars") {
   let (y, differential) = valueWithDifferential(at: 4, in: unary)
   expectEqual(22, y)
   expectEqual(4, differential(1))
+}
+
+struct A: Differentiable & AdditiveArithmetic {
+    var x: Float
+  }
+
+ForwardModeTests.test("StructInit") {
+  func structInit(x: Float) -> A {
+    return A(x: 2*x)
+  }
+
+  let (y, differential) = valueWithDifferential(at: 4, in: structInit)
+  expectEqual(A(x: 8), y)
+  expectEqual(A(x: 2), differential(1))
+}
+
+ForwardModeTests.test("StructExtract") {
+  func structExtract(x: A) -> Float {
+    return 2 * x.x
+  }
+
+  let (y, differential) = valueWithDifferential(at: A(x: 4), in: structExtract) 
+  expectEqual(8, y)
+  expectEqual(2, differential(A(x: 1)))
+}
+
+ForwardModeTests.test("LocalStructVariable") {
+  func structExtract(x: A) -> A {
+    let a = A(x: 2*x.x) // 2x
+    var b = A(x: a.x + 2) // 2x + 2
+    b = A(x: b.x + a.x) // 2x + 2 + 2x = 4x + 2
+    return b
+  }
+
+  let (y, differential) = valueWithDifferential(at: A(x: 4), in: structExtract) 
+  expectEqual(A(x: 18), y)
+  expectEqual(A(x: 4), differential(A(x: 1)))
 }
 
 runAllTests()

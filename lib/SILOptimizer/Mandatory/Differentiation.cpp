@@ -1,4 +1,3 @@
-
 //===--- Differentiation.cpp - SIL Automatic Differentiation --*- C++ -*---===//
 //
 // This source file is part of the Swift.org open source project
@@ -4277,16 +4276,12 @@ private:
   void visitStoreInstDifferential(StoreInst *si) {
     auto *bb = si->getParent();
     auto &diffBuilder = getDifferentialBuilder();
-
     auto tanValSrc = materializeTangent(getTangentValue(si->getSrc()),
                                         si->getLoc());
     auto tanValDest = getTangentBuffer(bb, si->getDest());
-
-//    diffBuilder.createStore(si->getLoc(), tanValSrc, tanValDest,
-//                            getBufferSOQ(tanValDest.getASTType(),
-//                                         getDifferential()));
-
-
+    diffBuilder.createStore(si->getLoc(), tanValSrc, tanValDest,
+                            getBufferSOQ(tanValDest->getType().getASTType(),
+                                         getDifferential()));
   }
 
   /// Handle `copy_addr` instruction.
@@ -4299,25 +4294,19 @@ private:
     if (errorOccurred)
       return;
 
-    auto destType = remapType(adjDest->getType());
-    // Disable the buffer's top-level cleanup (which is supposed to operate on
-    // the buffer), create a cleanup for the value that carrys all child
-    // cleanups.
+    // Begin access, set the corresponding tangent buffer, and end access.
     auto *readAccess = diffBuilder.createBeginAccess(
         cai->getLoc(), adjDest, SILAccessKind::Read,
         SILAccessEnforcement::Static, /*noNestedConflict*/ true,
         /*fromBuiltin*/ false);
-    // TODO: setToTangentBuffer?
-//    addToTangentBuffer(bb, cai->getSrc(), readAccess);
+    setTangentBuffer(bb, cai->getSrc(), readAccess);
     diffBuilder.createEndAccess(cai->getLoc(), readAccess, /*aborted*/ false);
-    // Set the buffer to zero.
-    emitZeroIndirect(destType.getASTType(), adjDest, cai->getLoc());
   }
   
 
   /// Handle `begin_access` instruction.
   ///   Original: y = begin_access x
-  ///    Adjoint: nothing (differentiability checks, cleanup propagation)
+  ///    Tangent: nothing (differentiability checks, cleanup propagation)
   void visitBeginAccessInstDifferential(BeginAccessInst *bai) {
     // Check for non-differentiable writes.
     if (bai->getAccessKind() == SILAccessKind::Modify) {
@@ -4335,8 +4324,9 @@ private:
       }
     }
     auto *bb = bai->getParent();
-    auto accessBuf = getTangentBuffer(bb, bai);
-    auto &sourceBuf = getTangentBuffer(bb, bai->getSource());
+    // TODO: finish this off.
+//    auto accessBuf = getTangentBuffer(bb, bai);
+//    auto &sourceBuf = getTangentBuffer(bb, bai->getSource());
   }
 
   // Add the mapping and emit the same instruction
@@ -4354,6 +4344,20 @@ private:
     auto &diffBuilder = getDifferentialBuilder();
     auto tanBuffer = getTangentBuffer(dsi->getParent(), dsi->getOperand());
     diffBuilder.createDeallocStack(dsi->getLoc(), tanBuffer);
+  }
+
+  void visitStructInstDifferential(StructInst *si) {
+    auto diffBuilder = getDifferentialBuilder();
+    auto *bb = si->getParent();
+    auto loc = si->getLoc();
+    // TODO: any way to just get the array of elements
+    SmallVector<SILValue, 4> elements;
+    for (auto elem : si->getElements())
+      elements.push_back(getTangentValue(elem).getConcreteValue());
+
+    auto tanExtract = diffBuilder.createStruct(loc, si->getType(), elements);
+
+    addTangentValue(bb, si, makeConcreteTangentValue(tanExtract));
   }
 
 public:
@@ -4481,7 +4485,18 @@ public:
         assert(lastArg->getType() == diffStructLoweredType);
         differentialStructArguments[&origBB] = lastArg;
       }
+
+      LLVM_DEBUG({
+        auto &s = getADDebugStream()
+            << "Original bb" + std::to_string(origBB.getDebugID())
+            << ": To differentiate or not to differentiate?\n";
+        for (auto &inst : origBB) {
+          s << (shouldBeDifferentiated(&inst, getIndices()) ? "[∂] " : "[ ] ")
+            << inst;
+        }
+      });
     }
+
     assert(diffBBMap.size() == 1
            && "Can only currently handle single basic block functions");
 
@@ -4490,7 +4505,9 @@ public:
     auto &diffBuilder = getDifferentialBuilder();
     auto diffParamArgs =
         differential.getArgumentsWithoutIndirectResults().drop_back();
-    assert(diffParamArgs.size() == attr->getIndices().parameters->getCapacity());
+    // TODO: this should exist, it's some weird problem with initializer and
+    // partial application.
+//    assert(diffParamArgs.size() == attr->getIndices().parameters->getCapacity());
     auto origParamArgs = original->getArgumentsWithoutIndirectResults();
 
     // Check if result is not varied.
@@ -4551,10 +4568,34 @@ public:
     if (errorOccurred)
       return true;
 
+    LLVM_DEBUG(getADDebugStream() << "Generated differential for "
+               << original->getName() << ":\n" << differential);
     LLVM_DEBUG(getADDebugStream() << "Generated JVP for "
                << original->getName() << ":\n" << *jvp);
     return errorOccurred;
   }
+
+      void visit(SILInstruction *inst) {
+        auto diffBuilder = getDifferentialBuilder();
+        if (errorOccurred)
+          return;
+        if (shouldBeDifferentiated(inst, getIndices())) {
+          LLVM_DEBUG(getADDebugStream() << "JVPEmitter visited:\n[ORIG]"
+                     << *inst);
+#ifndef NDEBUG
+          auto beforeInsertion = std::prev(diffBuilder.getInsertionPoint());
+#endif
+          SILInstructionVisitor::visit(inst); // TypeSubstCloner::visit(inst);
+          LLVM_DEBUG({
+            auto &s = llvm::dbgs() << "[DF] Emitted in Differential:\n";
+            auto afterInsertion = diffBuilder.getInsertionPoint();
+            for (auto it = ++beforeInsertion; it != afterInsertion; ++it)
+              s << *it;
+          });
+        } else {
+          SILInstructionVisitor::visit(inst); // TypeSubstCloner::visit(inst);
+        }
+      }
 
   void postProcess(SILInstruction *orig, SILInstruction *cloned) {
     if (errorOccurred)
@@ -4566,54 +4607,6 @@ public:
   SILBasicBlock *remapBasicBlock(SILBasicBlock *bb) {
     auto *jvpBB = BBMap[bb];
     return jvpBB;
-  }
-
-  /// General visitor for all instructions. If any error is emitted by previous
-  /// visits, bail out.
-  void visit(SILInstruction *inst) {
-    if (errorOccurred)
-      return;
-    TypeSubstCloner::visit(inst);
-  }
-
-  void visitSILInstruction(SILInstruction *inst) {
-    context.emitNondifferentiabilityError(inst, invoker,
-        diag::autodiff_expression_not_differentiable_note);
-    errorOccurred = true;
-  }
-
-  void visitReturnInst(ReturnInst *ri) {
-    auto loc = ri->getOperand().getLoc();
-    auto *origExit = ri->getParent();
-    auto &builder = getBuilder();
-    auto *diffStructVal = buildDifferentialValueStructValue(ri);
-
-    // Get the JVP value corresponding to the original functions's return value.
-    auto *origRetInst = cast<ReturnInst>(origExit->getTerminator());
-    auto origResult = getOpValue(origRetInst->getOperand());
-    SmallVector<SILValue, 8> origResults;
-    extractAllElements(origResult, builder, origResults);
-
-    // Get and partially apply the differential.
-    auto jvpGenericEnv = jvp->getGenericEnvironment();
-    auto jvpSubstMap = jvpGenericEnv
-        ? jvpGenericEnv->getForwardingSubstitutionMap()
-        : jvp->getForwardingSubstitutionMap();
-    auto *differentialRef =
-        builder.createFunctionRef(loc, &getDifferential());
-    auto *differentialPartialApply = builder.createPartialApply(
-        loc, differentialRef, jvpSubstMap, {diffStructVal},
-        ParameterConvention::Direct_Guaranteed);
-
-    // Return a tuple of the original result and pullback.
-    SmallVector<SILValue, 8> directResults;
-    directResults.append(origResults.begin(), origResults.end());
-    directResults.push_back(differentialPartialApply);
-    builder.createReturn(
-        ri->getLoc(), joinElements(directResults, builder, loc));
-
-    // Differential emission.
-    visitReturnInstDifferential(ri);
   }
 
   // If an `apply` has active results or active inout parameters, replace it
@@ -4837,7 +4830,43 @@ public:
     differentialValues[ai->getParent()].push_back(diffFunc);
 
     // Differential emission.
-    visitApplyInstDifferential(ai, indices);
+    if (shouldBeDifferentiated(ai, getIndices()))
+      visitApplyInstDifferential(ai, indices);
+  }
+
+  void visitReturnInst(ReturnInst *ri) {
+    auto loc = ri->getOperand().getLoc();
+    auto *origExit = ri->getParent();
+    auto &builder = getBuilder();
+    auto *diffStructVal = buildDifferentialValueStructValue(ri);
+
+    // Get the JVP value corresponding to the original functions's return value.
+    auto *origRetInst = cast<ReturnInst>(origExit->getTerminator());
+    auto origResult = getOpValue(origRetInst->getOperand());
+    SmallVector<SILValue, 8> origResults;
+    extractAllElements(origResult, builder, origResults);
+
+    // Get and partially apply the differential.
+    auto jvpGenericEnv = jvp->getGenericEnvironment();
+    auto jvpSubstMap = jvpGenericEnv
+    ? jvpGenericEnv->getForwardingSubstitutionMap()
+    : jvp->getForwardingSubstitutionMap();
+    auto *differentialRef =
+    builder.createFunctionRef(loc, &getDifferential());
+    auto *differentialPartialApply = builder.createPartialApply(
+        loc, differentialRef, jvpSubstMap, {diffStructVal},
+        ParameterConvention::Direct_Guaranteed);
+
+    // Return a tuple of the original result and pullback.
+    SmallVector<SILValue, 8> directResults;
+    directResults.append(origResults.begin(), origResults.end());
+    directResults.push_back(differentialPartialApply);
+    builder.createReturn(
+        ri->getLoc(), joinElements(directResults, builder, loc));
+
+    // Differential emission.
+    // TODO: should be calling 'shouldBeDifferentiated'. If shouldn't be differentiated, then return 0.
+    visitReturnInstDifferential(ri);
   }
 
   void visitLoadInst(LoadInst *li) {
@@ -4882,12 +4911,48 @@ public:
       visitStructExtractInstDifferential(sei);
   }
 
+  void visitStructInst(StructInst *si) {
+    TypeSubstCloner::visitStructInst(si);
+    if (shouldBeDifferentiated(si, getIndices()))
+      visitStructInstDifferential(si);
+  }
+
+  void visitArrayInitialization(ApplyInst *ai) {
+    llvm_unreachable("Unsupported SIL instruction.");
+  }
+
+  void visitTupleInst(TupleInst *ai) {
+    llvm_unreachable("Unsupported SIL instruction.");
+  }
+
+  void visitTupleExtractInst(TupleExtractInst *ai) {
+    llvm_unreachable("Unsupported SIL instruction.");
+  }
+
+  void visitBranchInst(BranchInst *bi) {
+    llvm_unreachable("Unsupported SIL instruction.");
+  }
+
+   void visitCondBranchInst(CondBranchInst *cbi) {
+     llvm_unreachable("Unsupported SIL instruction.");
+   }
+
+  void visitSwitchEnumInst(SwitchEnumInst *sei) {
+    llvm_unreachable("Unsupported SIL instruction.");
+  }
+
   void visitAutoDiffFunctionInst(AutoDiffFunctionInst *adfi) {
     // Clone `autodiff_function` from original to JVP, then add the cloned
     // instruction to the `autodiff_function` worklist.
     SILClonerWithScopes::visitAutoDiffFunctionInst(adfi);
     auto *newADFI = cast<AutoDiffFunctionInst>(getOpValue(adfi));
     context.getAutoDiffFunctionInsts().push_back(newADFI);
+  }
+
+  void visitSILInstruction(SILInstruction *inst) {
+    context.emitNondifferentiabilityError(inst, invoker,
+        diag::autodiff_expression_not_differentiable_note);
+    errorOccurred = true;
   }
 };
 } // end anonymous namespace
