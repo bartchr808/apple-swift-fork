@@ -4469,17 +4469,16 @@ public:
 
     // Create differential blocks and arguments.
     // TODO: Consider visiting original blocks in pre-order (dominance) order.
-    SmallVector<SILBasicBlock *, 8> preOrderDomOrder;
     auto &differential = getDifferential();
     auto *origEntry = original->getEntryBlock();
     for (auto &origBB : *original) {
       auto *diffBB = differential.createBasicBlock();
       diffBBMap.insert({&origBB, diffBB});
       auto diffStructLoweredType =
-      remapType(differentialInfo.getLinearMapStructLoweredType(&origBB));
-      // If the BB is the original exit, then the differential block that we just
-      // created must be the differential function's entry. Create differential
-      // entry arguments and continue.
+          remapType(differentialInfo.getLinearMapStructLoweredType(&origBB));
+      // If the BB is the original entry, then the differential block that we
+      // just created must be the differential function's entry. Create
+      // differential entry arguments and continue.
       if (&origBB == origEntry) {
         assert(diffBB->isEntry());
         createEntryArguments(&differential);
@@ -4507,7 +4506,8 @@ public:
     auto &diffBuilder = getDifferentialBuilder();
     auto diffParamArgs =
         differential.getArgumentsWithoutIndirectResults().drop_back();
-    assert(diffParamArgs.size() == attr->getIndices().parameters->getNumIndices());
+    assert(diffParamArgs.size() ==
+           attr->getIndices().parameters->getNumIndices());
     auto origParamArgs = original->getArgumentsWithoutIndirectResults();
 
     // Check if result is not varied.
