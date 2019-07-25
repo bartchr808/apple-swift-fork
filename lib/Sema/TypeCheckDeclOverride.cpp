@@ -13,13 +13,16 @@
 // This file implements semantic analysis for declaration overrides.
 //
 //===----------------------------------------------------------------------===//
-#include "TypeChecker.h"
 #include "CodeSynthesis.h"
 #include "MiscDiagnostics.h"
 #include "TypeCheckAvailability.h"
+#include "TypeChecker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/Availability.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/GenericSignature.h"
+#include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/TypeCheckRequests.h"
@@ -603,16 +606,20 @@ static bool overridesDifferentiableAttribute(ValueDecl *derivedDecl,
   if (!derivedAFD || !baseAFD)
     return false;
 
-  auto derivedDAs = derivedAFD->getAttrs().getAttributes<DifferentiableAttr>();
+  auto derivedDAs = derivedAFD->getAttrs()
+      .getAttributes<DifferentiableAttr, /*AllowInvalid*/ true>();
   auto baseDAs = baseAFD->getAttrs().getAttributes<DifferentiableAttr>();
 
-  // Make sure all the differentiable attributes in `baseDecl` are
+  // Make sure all the `@differentiable` attributes in `baseDecl` are
   // also declared in `derivedDecl`.
-  for (auto baseDA : baseDAs) {
+  bool diagnosed = false;
+  for (auto *baseDA : baseDAs) {
     auto baseParameters = baseDA->getParameterIndices();
     auto defined = false;
     for (auto derivedDA : derivedDAs) {
       auto derivedParameters = derivedDA->getParameterIndices();
+      // If base and derived parameter indices are both defined, check whether
+      // base parameter indices are a subset of derived parameter indices.
       if (derivedParameters &&
           baseParameters &&
           AutoDiffIndexSubset::get(
@@ -622,43 +629,57 @@ static bool overridesDifferentiableAttribute(ValueDecl *derivedDecl,
         defined = true;
         break;
       }
+      // Parameter indices may not be resolved because override matching happens
+      // before attribute checking for declaration type-checking.
+      // If parameter indices have not been resolved, avoid emitting diagnostic.
+      // Assume that attributes are valid.
+      if (!derivedParameters || !baseParameters) {
+        defined = true;
+        break;
+      }
     }
-    if (!defined) {
-      // Omit printing wrt clause if attribute differentiation parameters match
-      // inferred differentiation parameters.
-      auto *inferredParameters = TypeChecker::inferDifferentiableParameters(
-          derivedAFD, nullptr);
-      bool omitWrtClause = !baseParameters ||
-          baseParameters->parameters.count() ==
-          inferredParameters->parameters.count();
-      // Get `@differentiable` attribute description.
-      std::string baseDAString;
-      llvm::raw_string_ostream stream(baseDAString);
-      baseDA->print(stream, derivedDecl, omitWrtClause,
-                    /*omitAssociatedFunctions*/ true);
-      diags.diagnose(
-          derivedDecl, diag::overriding_decl_missing_differentiable_attr,
-          StringRef(stream.str()).trim());
-      return false;
-    }
+    if (defined)
+      continue;
+    diagnosed = true;
+    // Omit printing wrt clause if attribute differentiation parameters match
+    // inferred differentiation parameters.
+    auto *inferredParameters = TypeChecker::inferDifferentiableParameters(
+        derivedAFD, nullptr);
+    bool omitWrtClause = !baseParameters ||
+        baseParameters->parameters.count() ==
+        inferredParameters->parameters.count();
+    // Get `@differentiable` attribute description.
+    std::string baseDAString;
+    llvm::raw_string_ostream stream(baseDAString);
+    baseDA->print(stream, derivedDecl, omitWrtClause,
+                  /*omitAssociatedFunctions*/ true);
+    diags.diagnose(
+        derivedDecl, diag::overriding_decl_missing_differentiable_attr,
+        StringRef(stream.str()).trim());
+    diags.diagnose(baseDecl, diag::overridden_here);
   }
-
-  // If there is no differentiable attribute in `derivedDecl`, then
-  // overriding is not allowed.
-  if (derivedDAs.empty())
+  // If a diagnostic was produced, return false.
+  if (diagnosed)
     return false;
 
-  // Finally, go through all differentiable attributes in
-  // `derivedDecl` and check if they subsume any of the
-  // differentiable attributes in `baseDecl`.
+  // If there is no `@differentiable` attribute in `derivedDecl`, then
+  // overriding is not allowed.
+  auto *derivedDC = derivedDecl->getDeclContext();
+  auto *baseDC = baseDecl->getDeclContext();
+  if (derivedDC->getSelfClassDecl() && baseDC->getSelfClassDecl())
+    return false;
+
+  // Finally, go through all `@differentiable` attributes in `derivedDecl` and
+  // check if they subsume any of the `@differentiable` attributes in
+  // `baseDecl`.
   for (auto derivedDA : derivedDAs) {
     auto derivedParameters = derivedDA->getParameterIndices();
     auto overrides = true;
     for (auto baseDA : baseDAs) {
       auto baseParameters = baseDA->getParameterIndices();
-      // If the differentiable indices of `derivedDA` are a
-      // subset of those of `baseDA`, then `baseDA` subsumes
-      // `derivedDA` and the function is marked as overridden.
+      // If the parameter indices of `derivedDA` are a subset of those of
+      // `baseDA`, then `baseDA` subsumes `derivedDA` and the function is
+      // marked as overridden.
       if (derivedParameters &&
             baseParameters &&
             AutoDiffIndexSubset::get(
@@ -667,6 +688,9 @@ static bool overridesDifferentiableAttribute(ValueDecl *derivedDecl,
                   ctx, baseParameters->parameters))) {
         overrides = false;
         break;
+      }
+      if (!derivedParameters && !baseParameters) {
+        assert(false);
       }
     }
     if (overrides)
@@ -1020,6 +1044,98 @@ static void checkOverrideAccessControl(ValueDecl *baseDecl, ValueDecl *decl,
   }
 }
 
+static GenericSignature *getOverrideGenericSignature(ValueDecl *base,
+                                                     ValueDecl *derived) {
+  auto baseGenericCtx = base->getAsGenericContext();
+  auto &ctx = base->getASTContext();
+
+  if (!baseGenericCtx) {
+    return nullptr;
+  }
+
+  auto baseClass = base->getDeclContext()->getSelfClassDecl();
+
+  if (!baseClass) {
+    return nullptr;
+  }
+
+  auto derivedClass = derived->getDeclContext()->getSelfClassDecl();
+  auto *baseClassSig = baseClass->getGenericSignature();
+
+  if (!derivedClass) {
+    return nullptr;
+  }
+
+  if (derivedClass->getSuperclass().isNull()) {
+    return nullptr;
+  }
+
+  if (derivedClass->getGenericSignature() == nullptr &&
+      !baseGenericCtx->isGeneric()) {
+    return nullptr;
+  }
+
+  auto subMap = derivedClass->getSuperclass()->getContextSubstitutionMap(
+      derivedClass->getModuleContext(), baseClass);
+
+  if (baseGenericCtx->getGenericSignature() == nullptr) {
+    return nullptr;
+  }
+  unsigned derivedDepth = 0;
+
+  if (auto *derivedSig = derivedClass->getGenericSignature())
+    derivedDepth = derivedSig->getGenericParams().back()->getDepth() + 1;
+
+  GenericSignatureBuilder builder(ctx);
+  builder.addGenericSignature(derivedClass->getGenericSignature());
+
+  if (auto derivedGenericCtx = derived->getAsGenericContext()) {
+    if (derivedGenericCtx->isGeneric()) {
+      for (auto param : *derivedGenericCtx->getGenericParams()) {
+        builder.addGenericParameter(param);
+      }
+    }
+  }
+
+  auto source =
+      GenericSignatureBuilder::FloatingRequirementSource::forAbstract();
+
+  unsigned baseDepth = 0;
+
+  if (baseClassSig) {
+    baseDepth = baseClassSig->getGenericParams().back()->getDepth() + 1;
+  }
+
+  auto substFn = [&](SubstitutableType *type) -> Type {
+    auto *gp = cast<GenericTypeParamType>(type);
+
+    if (gp->getDepth() < baseDepth) {
+      return Type(gp).subst(subMap);
+    }
+
+    return CanGenericTypeParamType::get(
+        gp->getDepth() - baseDepth + derivedDepth, gp->getIndex(), ctx);
+  };
+
+  auto lookupConformanceFn =
+      [&](CanType depTy, Type substTy,
+          ProtocolDecl *proto) -> Optional<ProtocolConformanceRef> {
+    if (auto conf = subMap.lookupConformance(depTy, proto))
+      return conf;
+
+    return ProtocolConformanceRef(proto);
+  };
+
+  for (auto reqt : baseGenericCtx->getGenericSignature()->getRequirements()) {
+    if (auto substReqt = reqt.subst(substFn, lookupConformanceFn)) {
+      builder.addRequirement(*substReqt, source, nullptr);
+    }
+  }
+
+  auto *genericSig = std::move(builder).computeGenericSignature(SourceLoc());
+  return genericSig;
+}
+
 bool OverrideMatcher::checkOverride(ValueDecl *baseDecl,
                                     OverrideCheckingAttempt attempt) {
   auto &diags = ctx.Diags;
@@ -1035,6 +1151,30 @@ bool OverrideMatcher::checkOverride(ValueDecl *baseDecl,
                                baseDecl->getFullName());
     fixDeclarationName(diag, decl, baseDecl->getFullName());
     emittedMatchError = true;
+  }
+
+  auto baseGenericCtx = baseDecl->getAsGenericContext();
+  auto derivedGenericCtx = decl->getAsGenericContext();
+
+  if (baseGenericCtx && derivedGenericCtx) {
+    // If the generic signatures are different, then complain
+    if (auto newSig = getOverrideGenericSignature(baseDecl, decl)) {
+      if (auto derivedSig = derivedGenericCtx->getGenericSignature()) {
+        auto requirementsSatisfied =
+            derivedSig->requirementsNotSatisfiedBy(newSig).empty();
+
+        if (!requirementsSatisfied) {
+          diags.diagnose(
+              decl, diag::override_method_different_generic_sig,
+              decl->getBaseName(),
+              derivedGenericCtx->getGenericSignature()->getAsString(),
+              baseGenericCtx->getGenericSignature()->getAsString(),
+              newSig->getAsString());
+          diags.diagnose(baseDecl, diag::overridden_here);
+          emittedMatchError = true;
+        }
+      }
+    }
   }
 
   // If we have an explicit ownership modifier and our parent doesn't,
