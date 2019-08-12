@@ -12,7 +12,7 @@
 //
 // SWIFT_ENABLE_TENSORFLOW
 //
-// This file implements reverse-mode automatic differentiation.
+// This file implements automatic differentiation.
 //
 // NOTE: Although the AD feature is developed as part of the Swift for
 // TensorFlow project, it is completely independent from TensorFlow support.
@@ -64,6 +64,12 @@ static llvm::cl::opt<bool> SkipFoldingAutoDiffFunctionExtraction(
     "differentiation-skip-folding-autodiff-function-extraction",
     llvm::cl::init(true));
 
+/// This flag is used to enable full JVP generation.
+/// It will be removed when JVP/differential generation is robust.
+static llvm::cl::opt<bool> RunJVPGeneration(
+    "run-jvp-generation",
+    llvm::cl::init(false));
+
 //===----------------------------------------------------------------------===//
 // Helpers
 //===----------------------------------------------------------------------===//
@@ -114,6 +120,24 @@ collectAllFormalResultsInTypeOrder(SILFunction &function,
   for (auto &resInfo : convs.getResults())
     results.push_back(resInfo.isFormalDirect() ? dirResults[dirResIdx++]
                                                : indResults[indResIdx++]);
+}
+
+/// Given a function, gather all of its direct results in an order defined by
+/// its result type. Note that "formal results" refer to result values in the
+/// body of the function, not at call sites.
+static void
+collectAllDirectResultsInTypeOrder(SILFunction &function,
+                                   SmallVectorImpl<SILValue> &results) {
+  SILFunctionConventions convs(function.getLoweredFunctionType(),
+                               function.getModule());
+  auto *retInst = cast<ReturnInst>(function.findReturnBB()->getTerminator());
+  auto retVal = retInst->getOperand();
+  if (auto *tupleInst =
+      dyn_cast_or_null<TupleInst>(retVal->getDefiningInstruction()))
+    results.append(tupleInst->getElements().begin(),
+                      tupleInst->getElements().end());
+  else
+    results.push_back(retVal);
 }
 
 /// Given a function call site, gather all of its actual results (both direct
@@ -530,7 +554,7 @@ private:
       assert(linearMapStruct);
       auto linearMapStructTy =
           linearMapStruct->getDeclaredInterfaceType()->getCanonicalType();
-      // Create dummy declaration representing enum case p?arameter.
+      // Create dummy declaration representing enum case parameter.
       auto *decl = new (astCtx)
           ParamDecl(ParamDecl::Specifier::Default, loc, loc, Identifier(), loc,
                     Identifier(), moduleDecl);
@@ -3103,8 +3127,8 @@ private:
     auto &activityCollection = *activityAnalysis->get(original);
     auto &activityInfo = activityCollection.getActivityInfo(
         vjp->getLoweredFunctionType()->getGenericSignature());
-    LLVM_DEBUG(dumpActivityInfo(*original, indices, activityInfo,
-                                getADDebugStream()));
+    LLVM_DEBUG(
+        dumpActivityInfo(*original, indices, activityInfo, getADDebugStream()));
     return activityInfo;
   }
 
@@ -3129,8 +3153,8 @@ public:
     auto lookupConformance = LookUpConformanceInModule(module.getSwiftModule());
 
     // RAII that pushes the original function's generic signature to
-    // `module.Types` so that the calls `module.Types.getTypeLowering()` below
-    // will know the original function's generic parameter types.
+    // `module.Types` so that the calls to `module.Types.getTypeLowering()`
+    // below will know the original function's generic parameter types.
     Lowering::GenericContextScope genericContextScope(
         module.Types, origTy->getGenericSignature());
 
@@ -3506,7 +3530,9 @@ public:
     // If there's no active results, this function should not be differentiated.
     // Do standard cloning.
     if (!hasActiveResults || !hasActiveArguments) {
-      LLVM_DEBUG(getADDebugStream() << "No active results:\n" << *ai << '\n');
+      LLVM_DEBUG(getADDebugStream()
+                 << "No active results nor active arguments:\n"
+                 << *ai << '\n');
       TypeSubstCloner::visitApplyInst(ai);
       return;
     }
@@ -3740,200 +3766,6 @@ public:
 };
 } // end anonymous namespace
 
-namespace {
-class JVPEmitter final
-    : public TypeSubstCloner<JVPEmitter, SILOptFunctionBuilder> {
-private:
-  /// The global context.
-  ADContext &context;
-
-  /// The original function.
-  SILFunction *const original;
-
-  /// The `[differentiable]` attribute.
-  SILDifferentiableAttr *const attr;
-
-  /// The JVP function.
-  SILFunction *const jvp;
-
-  /// The differential function.
-  SILFunction *differential;
-
-  /// The differentiation invoker.
-  DifferentiationInvoker invoker;
-
-  bool errorOccurred = false;
-
-  ASTContext &getASTContext() const { return jvp->getASTContext(); }
-  SILModule &getModule() const { return jvp->getModule(); }
-  const SILAutoDiffIndices &getIndices() const { return attr->getIndices(); }
-
-  static SubstitutionMap getSubstitutionMap(SILFunction *original,
-                                            SILFunction *jvp) {
-    auto substMap = original->getForwardingSubstitutionMap();
-    if (auto *jvpGenEnv = jvp->getGenericEnvironment()) {
-      auto jvpSubstMap = jvpGenEnv->getForwardingSubstitutionMap();
-      substMap = SubstitutionMap::get(
-          jvpGenEnv->getGenericSignature(), QuerySubstitutionMap{jvpSubstMap},
-          LookUpConformanceInSubstitutionMap(jvpSubstMap));
-    }
-    return substMap;
-  }
-
-public:
-  explicit JVPEmitter(ADContext &context, SILFunction *original,
-                      SILDifferentiableAttr *attr, SILFunction *jvp,
-                      DifferentiationInvoker invoker)
-      : TypeSubstCloner(*jvp, *original, getSubstitutionMap(original, jvp)),
-        context(context), original(original), attr(attr), jvp(jvp),
-        invoker(invoker) {
-    // Create empty differential function.
-    differential = createEmptyDifferential();
-    context.getGeneratedFunctions().push_back(differential);
-  }
-
-  SILFunction *createEmptyDifferential() {
-    auto &module = context.getModule();
-    auto origTy = original->getLoweredFunctionType();
-    auto lookupConformance = LookUpConformanceInModule(module.getSwiftModule());
-
-    // RAII that pushes the original function's generic signature to
-    // `module.Types` so that the calls `module.Types.getTypeLowering()` below
-    // will know the original function's generic parameter types.
-    Lowering::GenericContextScope genericContextScope(
-        module.Types, origTy->getGenericSignature());
-
-    SmallVector<SILParameterInfo, 8> diffParams;
-    SmallVector<SILResultInfo, 8> diffResults;
-    auto origParams = origTy->getParameters();
-    auto indices = attr->getIndices();
-
-    // Add differential result for the seed.
-    auto origResInfo = origTy->getResults()[indices.source];
-    diffResults.push_back(
-        SILResultInfo(origResInfo.getType()
-            ->getAutoDiffAssociatedTangentSpace(lookupConformance)
-            ->getCanonicalType(), origResInfo.getConvention()));
-
-    // Add pullback results for the requested wrt parameters.
-    for (auto i : indices.parameters->getIndices()) {
-      auto origParam = origParams[i];
-      diffParams.push_back(
-          SILParameterInfo(origParam.getType()
-              ->getAutoDiffAssociatedTangentSpace(lookupConformance)
-              ->getCanonicalType(), origParam.getConvention()));
-    }
-    Mangle::ASTMangler mangler;
-    auto diffName = original->getASTContext().getIdentifier(
-        mangler.mangleAutoDiffLinearMapHelper(
-            original->getName(), AutoDiffLinearMapKind::Differential,
-            indices)).str();
-    auto diffGenericSig = getAssociatedFunctionGenericSignature(attr, original);
-    auto *diffGenericEnv = diffGenericSig
-        ? diffGenericSig->createGenericEnvironment()
-        : nullptr;
-    auto diffType = SILFunctionType::get(
-        diffGenericSig, origTy->getExtInfo(), origTy->getCoroutineKind(),
-        origTy->getCalleeConvention(), diffParams, {}, diffResults, None,
-        original->getASTContext());
-
-    SILOptFunctionBuilder fb(context.getTransform());
-    // The generated tangent linkage is set to Hidden because generated tangent
-    // are never called cross-module.
-    auto linkage = SILLinkage::Hidden;
-    auto *differential = fb.createFunction(
-        linkage, diffName, diffType, diffGenericEnv, original->getLocation(),
-        original->isBare(), IsNotTransparent, original->isSerialized(),
-        original->isDynamicallyReplaceable());
-    differential->setOwnershipEliminated();
-    differential->setDebugScope(
-        new (module) SILDebugScope(original->getLocation(), differential));
-    // Create empty body of differential.
-    auto diffConv = differential->getConventions();
-    auto *entry = differential->createBasicBlock();
-    createEntryArguments(differential);
-    // Return undef.
-    SILBuilder builder(entry);
-    auto loc = differential->getLocation();
-    builder.createReturn(loc, SILUndef::get(
-        differential->mapTypeIntoContext(diffConv.getSILResultType()),
-        *differential));
-    return differential;
-  }
-
-  /// Run JVP generation. Returns true on error.
-  bool run();
-
-  void postProcess(SILInstruction *orig, SILInstruction *cloned) {
-    if (errorOccurred)
-      return;
-    SILClonerWithScopes::postProcess(orig, cloned);
-  }
-
-  /// General visitor for all instructions. If any error is emitted by previous
-  /// visits, bail out.
-  void visit(SILInstruction *inst) {
-    if (errorOccurred)
-      return;
-    TypeSubstCloner::visit(inst);
-  }
-
-  void visitSILInstruction(SILInstruction *inst) {
-    context.emitNondifferentiabilityError(inst, invoker,
-        diag::autodiff_expression_not_differentiable_note);
-    errorOccurred = true;
-  }
-
-private:
-  /// Get the lowered SIL type of the given nominal type declaration.
-  SILType getNominalDeclLoweredType(NominalTypeDecl *nominal) {
-    auto nomType = getOpASTType(
-        nominal->getDeclaredInterfaceType()->getCanonicalType());
-    auto nomSILType = context.getTypeConverter().getLoweredType(
-        nomType, ResilienceExpansion::Minimal);
-    return nomSILType;
-  }
-
-public:
-  void visitReturnInst(ReturnInst *ri) {
-    auto loc = ri->getOperand().getLoc();
-    auto *origExit = ri->getParent();
-    auto &builder = getBuilder();
-
-    // Get the JVP value corresponding to the original functions's return value.
-    auto *origRetInst = cast<ReturnInst>(origExit->getTerminator());
-    auto origResult = getOpValue(origRetInst->getOperand());
-    SmallVector<SILValue, 8> origResults;
-    extractAllElements(origResult, builder, origResults);
-
-    // Return a tuple of the original result and an undef, which at some point
-    // will be the differential.
-    SmallVector<SILValue, 8> directResults;
-    directResults.append(origResults.begin(), origResults.end());
-
-    // Get differential result type.
-    auto jvpResultArray = jvp->getLoweredFunctionType()->getResults();
-    auto funcType = jvpResultArray.back().getType();
-    auto silFuncCanType = funcType->castTo<SILFunctionType>()
-        ->getCanonicalType();
-
-    directResults.push_back(
-        SILUndef::get(jvp->mapTypeIntoContext(
-            SILType::getPrimitiveObjectType(silFuncCanType)), *jvp));
-    builder.createReturn(
-        ri->getLoc(), joinElements(directResults, builder, loc));
-  }
-
-  void visitAutoDiffFunctionInst(AutoDiffFunctionInst *adfi) {
-    // Clone `autodiff_function` from original to JVP, then add the cloned
-    // instruction to the `autodiff_function` worklist.
-    TypeSubstCloner::visitAutoDiffFunctionInst(adfi);
-    auto *newADFI = cast<AutoDiffFunctionInst>(getOpValue(adfi));
-    context.getAutoDiffFunctionInsts().push_back(newADFI);
-  }
-};
-} // end anonymous namespace
-
 //===----------------------------------------------------------------------===//
 // AdjointValue - a symbolic representation for adjoint values that allows
 // for efficient differentiation of aggregates.
@@ -4096,6 +3928,1668 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
 
 } // end anonymous namespace
 
+namespace {
+
+class JVPEmitter final
+    : public TypeSubstCloner<JVPEmitter, SILOptFunctionBuilder> {
+private:
+  /// The global context.
+  ADContext &context;
+
+  /// The original function.
+  SILFunction *const original;
+
+  /// The `[differentiable]` attribute.
+  SILDifferentiableAttr *const attr;
+
+  /// The JVP function.
+  SILFunction *const jvp;
+
+  llvm::BumpPtrAllocator allocator;
+
+  /// Info from activity analysis on the original function.
+  const DifferentiableActivityInfo &activityInfo;
+
+  /// The differential info.
+  LinearMapInfo differentialInfo;
+
+  /// The differentiation invoker.
+  DifferentiationInvoker invoker;
+
+  bool errorOccurred = false;
+
+  ///
+  /// Differential generation related fields.
+  ///
+
+  /// The builder for the differential function.
+  SILBuilder differentialAndBuilder;
+
+  /// Mapping from differential basic blocks to differential struct arguments.
+  DenseMap<SILBasicBlock *, SILArgument *> differentialStructArguments;
+
+  /// Mapping from original basic blocks and original values to corresponding
+  /// tangent values.
+  DenseMap<SILValue, AdjointValue> tangentValueMap;
+
+  DenseMap<SILBasicBlock *, SILBasicBlock *> diffBBMap;
+
+  /// Stack buffers allocated for storing local tangent values.
+  SmallVector<SILValue, 8> differentialLocalAllocations;
+
+  /// Mapping from original blocks to differential values. Used to build differential
+  /// struct instances.
+  DenseMap<SILBasicBlock *, SmallVector<SILValue, 8>> differentialValues;
+
+  /// Mapping from original basic blocks and original buffers to corresponding
+  /// tangent buffers.
+  DenseMap<std::pair<SILBasicBlock *, SILValue>, SILValue> bufferMap;
+
+  /// An auxiliary differential local allocation builder.
+  SILBuilder diffLocalAllocBuilder;
+
+  //--------------------------------------------------------------------------//
+  // Getters
+  //--------------------------------------------------------------------------//
+
+  ASTContext &getASTContext() const { return jvp->getASTContext(); }
+  SILModule &getModule() const { return jvp->getModule(); }
+  const SILAutoDiffIndices &getIndices() const { return attr->getIndices(); }
+  SILFunction &getDifferential() { return differentialAndBuilder.getFunction(); }
+  SILBuilder &getDifferentialBuilder() { return differentialAndBuilder; }
+  SILArgument *getDifferentialStructArgument(SILBasicBlock *origBB) {
+#ifndef NDEBUG
+    auto *diffStruct = differentialStructArguments[origBB]->getType()
+        .getStructOrBoundGenericStruct();
+    assert(diffStruct == differentialInfo.getLinearMapStruct(origBB));
+#endif
+    return differentialStructArguments[origBB];
+  }
+
+  //--------------------------------------------------------------------------//
+  // Initialization helpers
+  //--------------------------------------------------------------------------//
+
+  static SubstitutionMap getSubstitutionMap(SILFunction *original,
+                                            SILFunction *jvp) {
+    auto substMap = original->getForwardingSubstitutionMap();
+    if (auto *jvpGenEnv = jvp->getGenericEnvironment()) {
+      auto jvpSubstMap = jvpGenEnv->getForwardingSubstitutionMap();
+      substMap = SubstitutionMap::get(
+          jvpGenEnv->getGenericSignature(), QuerySubstitutionMap{jvpSubstMap},
+          LookUpConformanceInSubstitutionMap(jvpSubstMap));
+    }
+    return substMap;
+  }
+
+  /// Returns the activity info about the SILValues in the original function.
+  static const DifferentiableActivityInfo &getActivityInfo(
+      ADContext &context, SILFunction *original,
+      const SILAutoDiffIndices &indices, SILFunction *jvp) {
+    // Get activity info of the original function.
+    auto &passManager = context.getPassManager();
+    auto *activityAnalysis =
+        passManager.getAnalysis<DifferentiableActivityAnalysis>();
+    auto &activityCollection = *activityAnalysis->get(original);
+    auto &activityInfo = activityCollection.getActivityInfo(
+        jvp->getLoweredFunctionType()->getGenericSignature());
+    LLVM_DEBUG(
+        dumpActivityInfo(*original, indices, activityInfo, getADDebugStream()));
+    return activityInfo;
+  }
+
+  static SILBuilder
+  initializeDifferentialAndBuilder(ADContext &context, SILFunction *original,                                                     SILDifferentiableAttr *attr,
+                                   LinearMapInfo *linearMapInfo) {
+    auto *differential =
+        createEmptyDifferential(context, original, attr, linearMapInfo);
+    return SILBuilder(*differential);
+  }
+
+  //--------------------------------------------------------------------------//
+  // General utilities
+  //--------------------------------------------------------------------------//
+
+  SILBasicBlock::iterator getNextDifferentialLocalAllocationInsertionPoint() {
+    // If there are no local allocations, insert at the beginning of the tangent
+    // entry.
+    if (differentialLocalAllocations.empty())
+      return getDifferential().getEntryBlock()->begin();
+    // Otherwise, insert before the last local allocation. Inserting before
+    // rather than after ensures that allocation and zero initialization
+    // instructions are grouped together.
+    auto lastLocalAlloc = differentialLocalAllocations.back();
+    auto it = lastLocalAlloc->getDefiningInstruction()->getIterator();
+    return it;
+  }
+
+  /// Get the lowered SIL type of the given nominal type declaration.
+  SILType getNominalDeclLoweredType(NominalTypeDecl *nominal) {
+    auto nomType =
+        getOpASTType(nominal->getDeclaredInterfaceType()->getCanonicalType());
+    auto nomSILType = context.getTypeConverter().getLoweredType(
+        nomType, ResilienceExpansion::Minimal);
+    return nomSILType;
+  }
+
+  /// Build a differential struct value for the original block corresponding to
+  /// the given terminator.
+  StructInst *buildDifferentialValueStructValue(TermInst *termInst) {
+    assert(termInst->getFunction() == original);
+    auto loc = termInst->getFunction()->getLocation();
+    auto *origBB = termInst->getParent();
+    auto *jvpBB = BBMap[origBB];
+    assert(jvpBB && "Basic block mapping should exist");
+    auto *diffStruct = differentialInfo.getLinearMapStruct(origBB);
+    assert(diffStruct && "The differential struct should have been declared");
+    auto structLoweredTy = getNominalDeclLoweredType(diffStruct);
+    auto bbDifferentialValues = differentialValues[origBB];
+    if (!origBB->isEntry()) {
+      auto *enumArg = jvpBB->getArguments().back();
+      bbDifferentialValues.insert(bbDifferentialValues.begin(), enumArg);
+    }
+    return getBuilder().createStruct(loc, structLoweredTy,
+                                     bbDifferentialValues);
+  }
+
+  bool shouldBeDifferentiated(SILInstruction *inst,
+                              const SILAutoDiffIndices &indices) {
+    // Anything with an active result should be differentiated.
+    if (llvm::any_of(inst->getResults(), [&](SILValue val) {
+          return activityInfo.isActive(val, indices);
+        }))
+      return true;
+    // Anything with an an active argument should be differentiated
+    // (i.e. `return %0`).
+    if (dyn_cast<ReturnInst>(inst) &&
+        llvm::any_of(inst->getAllOperands(), [&](Operand &val) {
+      return activityInfo.isActive(val.get(), indices);
+    }))
+      return true;
+    if (auto *ai = dyn_cast<ApplyInst>(inst)) {
+      // Function applications with an active indirect result should be
+      // differentiated.
+      for (auto indRes : ai->getIndirectSILResults())
+        if (activityInfo.isActive(indRes, indices))
+          return true;
+      // Function applications with an inout argument should be differentiated.
+      auto paramInfos = ai->getSubstCalleeConv().getParameters();
+      for (auto i : swift::indices(paramInfos))
+        if (paramInfos[i].isIndirectInOut() &&
+            activityInfo.isActive(
+                ai->getArgumentsWithoutIndirectResults()[i], indices))
+          return true;
+    }
+    // Instructions that may write to memory and that have an active operand
+    // should be differentiated.
+    if (inst->mayWriteToMemory())
+      for (auto &op : inst->getAllOperands())
+        if (activityInfo.isActive(op.get(), indices))
+          return true;
+    return false;
+  }
+
+  //--------------------------------------------------------------------------//
+  // Tangent value factory methods
+  //--------------------------------------------------------------------------//
+
+  AdjointValue makeZeroTangentValue(SILType type) {
+    return AdjointValue::createZero(allocator, remapTypeInDifferential(type));
+  }
+
+  AdjointValue makeConcreteTangentValue(SILValue value) {
+    return AdjointValue::createConcrete(allocator, value);
+  }
+
+  //--------------------------------------------------------------------------//
+  // Tangent materialization
+  //--------------------------------------------------------------------------//
+
+  void emitZeroIndirect(CanType type, SILValue bufferAccess,
+                        SILLocation loc) {
+    auto builder = getDifferentialBuilder();
+    auto tangentSpace = getTangentSpace(type);
+    assert(tangentSpace && "No tangent space for this type");
+    switch (tangentSpace->getKind()) {
+    case VectorSpace::Kind::Vector:
+      emitZeroIntoBuffer(builder, type, bufferAccess, loc);
+      return;
+    case VectorSpace::Kind::Tuple: {
+      auto tupleType = tangentSpace->getTuple();
+      SmallVector<SILValue, 8> zeroElements;
+      for (unsigned i : range(tupleType->getNumElements())) {
+        auto eltAddr = builder.createTupleElementAddr(loc, bufferAccess, i);
+        emitZeroIndirect(tupleType->getElementType(i)->getCanonicalType(),
+                         eltAddr, loc);
+      }
+      return;
+    }
+    case VectorSpace::Kind::Function: {
+      llvm_unreachable(
+          "Unimplemented: Emit thunks for abstracting zero initialization");
+    }
+    }
+  }
+
+  SILValue emitZeroDirect(CanType type, SILLocation loc) {
+    auto diffBuilder = getDifferentialBuilder();
+    auto silType = getModule().Types.getLoweredLoadableType(
+        type, ResilienceExpansion::Minimal);
+    auto *buffer = diffBuilder.createAllocStack(loc, silType);
+    emitZeroIndirect(type, buffer, loc);
+    auto *loaded = diffBuilder.createLoad(
+        loc, buffer, getBufferLOQ(type, getDifferential()));
+    diffBuilder.createDeallocStack(loc, buffer);
+    return loaded;
+  }
+
+  SILValue materializeTangentDirect(AdjointValue val, SILLocation loc) {
+    assert(val.getType().isObject());
+    LLVM_DEBUG(getADDebugStream()
+               << "Materializing tangents for " << val << '\n');
+    switch (val.getKind()) {
+    case AdjointValueKind::Zero: {
+      auto zeroVal = emitZeroDirect(val.getSwiftType(), loc);
+      return zeroVal;
+    }
+    case AdjointValueKind::Aggregate:
+      llvm_unreachable(
+          "Tuples and structs are not supported in forward mode yet.");
+    case AdjointValueKind::Concrete:
+      return val.getConcreteValue();
+  }
+  }
+
+  SILValue materializeTangent(AdjointValue val, SILLocation loc) {
+    if (val.isConcrete()) {
+      LLVM_DEBUG(getADDebugStream()
+                 << "Materializing tangent: Value is concrete.\n");
+      return val.getConcreteValue();
+    }
+    LLVM_DEBUG(getADDebugStream() << "Materializing tangent: Value is "
+                                     "non-concrete. Materializing directly.\n");
+    return materializeTangentDirect(val, loc);
+  }
+
+  //--------------------------------------------------------------------------//
+  // Tangent buffer mapping
+  //--------------------------------------------------------------------------//
+
+  void setTangentBuffer(SILBasicBlock *origBB, SILValue originalBuffer,
+                        SILValue tangentBuffer) {
+    assert(originalBuffer->getType().isAddress());
+    auto insertion =
+        bufferMap.try_emplace({origBB, originalBuffer}, tangentBuffer);
+    assert(insertion.second); (void)insertion;
+  }
+
+  SILValue getTangentProjection(SILBasicBlock *origBB,
+                                SILValue originalProjection) {
+    auto diffBuilder = getDifferentialBuilder();
+
+    // Handle `struct_element_addr`.
+    if (auto *seai = dyn_cast<StructElementAddrInst>(originalProjection)) {
+      auto adjSource = getTangentBuffer(origBB, seai->getOperand());
+      auto *tangentVectorDecl =
+          adjSource->getType().getStructOrBoundGenericStruct();
+      auto tanFieldLookup =
+          tangentVectorDecl->lookupDirect(seai->getField()->getName());
+      assert(tanFieldLookup.size() == 1);
+      auto *tanField = cast<VarDecl>(tanFieldLookup.front());
+      return diffBuilder.createStructElementAddr(
+          seai->getLoc(), adjSource, tanField);
+    }
+
+    // Handle `tuple_element_addr`.
+    if (auto *teai = dyn_cast<TupleElementAddrInst>(originalProjection)) {
+      auto source = teai->getOperand();
+      auto adjSource = getTangentBuffer(origBB, source);
+      // If the adjoint buffer of the source does not have a tuple type, then
+      // it must represent a "single element tuple type". Return it directly.
+      if (!adjSource->getType().is<TupleType>())
+        return adjSource;
+      auto origTupleTy = source->getType().castTo<TupleType>();
+      unsigned adjIndex = 0;
+      for (unsigned i : range(teai->getFieldNo())) {
+        if (getTangentSpace(
+                origTupleTy->getElement(i).getType()->getCanonicalType()))
+          ++adjIndex;
+      }
+      return diffBuilder.createTupleElementAddr(
+          teai->getLoc(), adjSource, adjIndex);
+    }
+
+    // Handle `begin_access`.
+    if (auto *bai = dyn_cast<BeginAccessInst>(originalProjection)) {
+      auto adjBase = getTangentBuffer(origBB, bai->getOperand());
+      if (errorOccurred)
+        return (bufferMap[{origBB, originalProjection}] = SILValue());
+      // Return the base buffer's tangent buffer.
+      return adjBase;
+    }
+    return SILValue();
+  }
+
+  SILValue &getTangentBuffer(SILBasicBlock *origBB, SILValue originalBuffer) {
+    auto diffBuilder = getDifferentialBuilder();
+    assert(originalBuffer->getType().isAddress());
+    assert(originalBuffer->getFunction() == original);
+    auto insertion = bufferMap.try_emplace({origBB, originalBuffer},
+                                           SILValue());
+    if (!insertion.second) // not inserted.
+      return insertion.first->getSecond();
+
+    // Diagnose `struct_element_addr` instructions to `@noDerivative` fields.
+    if (auto *seai = dyn_cast<StructElementAddrInst>(originalBuffer)) {
+      if (seai->getField()->getAttrs().hasAttribute<NoDerivativeAttr>()) {
+        context.emitNondifferentiabilityError(
+            originalBuffer, invoker,
+            diag::autodiff_noderivative_stored_property);
+        errorOccurred = true;
+        return (bufferMap[{origBB, originalBuffer}] = SILValue());
+      }
+    }
+
+    // If the original buffer is a projection, return a corresponding projection
+    // into the adjoint buffer.
+    if (auto adjProj = getTangentProjection(origBB, originalBuffer)) {
+      return (bufferMap[{origBB, originalBuffer}] = adjProj);
+    }
+
+    // Set insertion point for local allocation builder: before the last local
+    // allocation, or at the start of the tangent function's entry if no local
+    // allocations exist yet.
+    diffLocalAllocBuilder.setInsertionPoint(
+        getDifferential().getEntryBlock(),
+        getNextDifferentialLocalAllocationInsertionPoint());
+
+    // Allocate local buffer and initialize to zero.
+    auto bufObjectType = getRemappedTangentType(originalBuffer->getType());
+    auto *newBuf = diffLocalAllocBuilder.createAllocStack(
+        originalBuffer.getLoc(), bufObjectType);
+
+    // Temporarily change global builder insertion point and emit zero into the
+    // local buffer.
+    auto insertionPoint = diffLocalAllocBuilder.getInsertionBB();
+    diffBuilder.setInsertionPoint(
+        diffLocalAllocBuilder.getInsertionBB(),
+        diffLocalAllocBuilder.getInsertionPoint());
+    emitZeroIndirect(bufObjectType.getASTType(), newBuf, newBuf->getLoc());
+    diffBuilder.setInsertionPoint(insertionPoint);
+
+    // Create cleanup for local buffer.
+    differentialLocalAllocations.push_back(newBuf);
+    return (insertion.first->getSecond() = newBuf);
+  }
+
+  //--------------------------------------------------------------------------//
+  // Differential type calculations
+  //--------------------------------------------------------------------------//
+
+  /// Get the result of the `apply` instructions.
+  SILValue getApplyResult(ApplyInst *ai, unsigned source) {
+    SmallVector<SILValue, 8> dirResults;
+    collectAllExtractedElements(ai, dirResults);
+    SmallVector<SILValue, 8> allResults;
+    collectAllActualResultsInTypeOrder(
+        ai, dirResults, ai->getIndirectSILResults(), allResults);
+    return allResults[source];
+  }
+
+  /// Substitutes all replacement types of the given substitution map using the
+  /// adjoint function's substitution map.
+  SubstitutionMap remapSubstitutionMapInDifferential(SubstitutionMap substMap) {
+    return substMap.subst(getDifferential().getForwardingSubstitutionMap());
+#if 0
+    auto *diffGenEnv = getDifferential().getGenericEnvironment();
+    if (!diffGenEnv)
+      return substMap;
+    auto diffSubstMap = diffGenEnv->getForwardingSubstitutionMap();
+    return SubstitutionMap::get(
+        diffGenEnv->getGenericSignature(), QuerySubstitutionMap{diffSubstMap},
+        LookUpConformanceInSubstitutionMap(diffSubstMap));
+#endif
+  }
+
+  /// Remap any archetypes into the differential function's context.
+  Type remapASTTypeInDifferential(Type ty) {
+    if (ty->hasArchetype())
+      return getDifferential().mapTypeIntoContext(ty->mapTypeOutOfContext());
+    return getDifferential().mapTypeIntoContext(ty);
+  }
+
+  /// Remap any archetypes into the differential function's context.
+  SILType remapTypeInDifferential(SILType ty) {
+    if (ty.hasArchetype())
+      return getDifferential().mapTypeIntoContext(ty.mapTypeOutOfContext());
+    return getDifferential().mapTypeIntoContext(ty);
+  }
+
+  Optional<VectorSpace> getTangentSpace(CanType type) {
+    return type->getAutoDiffAssociatedTangentSpace(
+        LookUpConformanceInModule(getModule().getSwiftModule()));
+  }
+
+  /// Assuming the given type conforms to `Differentiable` after remapping,
+  /// returns the associated tangent space type.
+  CanType getRemappedTangentASTType(Type type) {
+    auto remappedType = remapASTTypeInDifferential(type)->getCanonicalType();
+    return getTangentSpace(remappedType)->getCanonicalType();
+  }
+
+  /// Assuming the given type conforms to `Differentiable` after remapping,
+  /// returns the associated tangent space SIL type.
+  SILType getRemappedTangentType(SILType type) {
+    return SILType::getPrimitiveType(
+        getTangentSpace(remapTypeInDifferential(type).getASTType())
+            ->getCanonicalType(),
+        type.getCategory());
+  }
+
+  //--------------------------------------------------------------------------//
+  // Tangent value mapping
+  //--------------------------------------------------------------------------//
+
+  /// Get the tangent for an original value. The given value must be in the
+  /// original function.
+  ///
+  /// This method first tries to find an entry in `tangentValueMap`. If a tangent
+  /// doesn't exist, create a zero tangent.
+  AdjointValue getTangentValue(SILValue originalValue) {
+    assert(originalValue->getType().isObject());
+    assert(originalValue->getFunction() == original);
+    auto insertion = tangentValueMap.try_emplace(
+        originalValue, makeZeroTangentValue(
+        getRemappedTangentType(originalValue->getType())));
+    return insertion.first->getSecond();
+  }
+
+  /// Map the tangent value to the given original value.
+  void setTangentValue(SILBasicBlock *origBB, SILValue originalValue,
+                       AdjointValue newTangentValue) {
+    assert(originalValue->getType().isObject());
+    assert(newTangentValue.getType().isObject());
+    assert(originalValue->getFunction() == original);
+    LLVM_DEBUG(getADDebugStream() << "Adding tangent for " << originalValue);
+    // The tangent value must be in the tangent space.
+    assert(newTangentValue.getType() ==
+           getRemappedTangentType(originalValue->getType()));
+    auto insertion =
+        tangentValueMap.try_emplace(originalValue, newTangentValue);
+    auto inserted = insertion.second;
+    assert(inserted && "The tangent value should not already exist.");
+  }
+
+  //--------------------------------------------------------------------------//
+  // Tangent emission helpers
+  //--------------------------------------------------------------------------//
+
+  /// Helper that emits the final return instruction in a basic block of the differential function. This is
+  /// needed for when there are indrect outputs.
+  void emitReturnInstForDifferential() {
+    auto &differential = getDifferential();
+    auto diffLoc = differential.getLocation();
+    auto diffBuilder = getDifferentialBuilder();
+
+    // This vector will contain all the materialized return elements.
+    SmallVector<SILValue, 8> retElts;
+
+    SmallVector<SILValue, 2> results;
+    collectAllDirectResultsInTypeOrder(*original, results);
+
+    // Materializes the return element corresponding to the result
+    // `resultIndex` into the `retElts` vector.
+    auto addRetElt = [&](unsigned resultIndex) -> void {
+      auto origResult = results[resultIndex];
+      assert(origResult->getType().isObject() &&
+             "Should only be handling direct results for return inst");
+        auto diffVal = getTangentValue(origResult);
+        auto val = materializeTangent(diffVal, diffLoc); // PROBLEM
+//        diffBuilder.createRetainValue(diffLoc, val, diffBuilder.getDefaultAtomicity());
+        retElts.push_back(val);
+    };
+    // Collect differentiation parameter adjoints.
+    for (auto i : range(results.size()))
+      addRetElt(i);
+
+    diffBuilder.createReturn(
+        diffLoc, joinElements(retElts, diffBuilder, diffLoc));
+  }
+
+  void emitTangentForApplyInst(
+      ApplyInst *ai, SILAutoDiffIndices indices,
+      CanSILFunctionType originalDifferentialType) {
+    auto *bb = ai->getParent();
+    auto loc = ai->getLoc();
+    auto &diffBuilder = getDifferentialBuilder();
+
+    // Get the differential.
+    auto *field = differentialInfo.lookUpLinearMapDecl(ai);
+    assert(field);
+    SILValue differential = diffBuilder.createStructExtract(
+        loc, getDifferentialStructArgument(ai->getParent()), field);
+    auto differentialType = remapTypeInDifferential(differential->getType())
+        .castTo<SILFunctionType>();
+
+    SmallVector<SILValue, 8> diffArgs;
+    for (auto origArg : ai->getArguments()) {
+      // Get the tangent value of the original parameter.
+      if (!activityInfo.isActive(origArg, getIndices()))
+        continue;
+      SILValue tanParam;
+      if (origArg->getType().isObject()) {
+        // If original result is a `tuple_extract`, materialize tangent value of
+        // `ai` and extract the corresponding element tangent value.
+        if (auto *tupleExtract =
+                dyn_cast<TupleExtractInst>(origArg)) {
+          auto tangentTuple = materializeTangent(getTangentValue(ai), loc);
+          tanParam = diffBuilder.emitTupleExtract(
+              loc, tangentTuple, tupleExtract->getFieldNo());
+        }
+        // Otherwise, materialize tangent value of `ai`.
+        else {
+          tanParam = materializeTangent(getTangentValue(origArg), loc);
+        }
+      } else {
+        tanParam = getTangentBuffer(ai->getParent(), origArg);
+        if (errorOccurred)
+          return;
+      }
+      diffArgs.push_back(tanParam);
+    }
+
+    // If callee pullback was reabstracted in JVP, reabstract callee pullback.
+    if (!differentialType->isEqual(originalDifferentialType)) {
+      SILOptFunctionBuilder fb(context.getTransform());
+      auto *thunk = getOrCreateReabstractionThunk(
+          fb, context.getModule(), loc, &getDifferential(),
+          differentialType, originalDifferentialType);
+      auto *thunkRef = diffBuilder.createFunctionRef(loc, thunk);
+      differential = diffBuilder.createPartialApply(
+         loc, thunkRef,
+         remapSubstitutionMapInDifferential(thunk->getForwardingSubstitutionMap()),
+         {differential}, differentialType->getCalleeConvention());
+    }
+
+    // Call the differential.
+    auto *differentialCall = diffBuilder.createApply(
+        loc, differential, SubstitutionMap(), diffArgs,
+        /*isNonThrowing*/ false);
+    assert(differentialCall->getNumResults() == 1 &&
+           "Expected differential to return one result");
+
+    // Get the original results of the `apply` instructions.
+    SmallVector<SILValue, 8> origDirResults;
+    collectAllExtractedElements(ai, origDirResults);
+    SmallVector<SILValue, 8> origAllResults;
+    collectAllActualResultsInTypeOrder(
+        ai, origDirResults, ai->getIndirectSILResults(), origAllResults);
+    auto origResult = origAllResults[indices.source];
+
+    // Get the differential results of the `apply` instructions.
+    SmallVector<SILValue, 8> differentialDirResults;
+    collectAllExtractedElements(differentialCall, differentialDirResults);
+    SmallVector<SILValue, 8> differentialAllResults;
+    collectAllActualResultsInTypeOrder(
+        differentialCall, differentialDirResults,
+        differentialCall->getIndirectSILResults(), differentialAllResults);
+    auto differentialResult = differentialAllResults[indices.source];
+
+    // Add tangent for original result.
+    // TODO: what about indirect results?
+    assert(indices.source == 0 && "Expected result index to be first.");
+    if (origResult->getType().isObject())
+      setTangentValue(bb, origResult,
+                      makeConcreteTangentValue(differentialResult));
+  }
+
+  /// Handle `struct_extract` instruction.
+  ///   Original: y = struct_extract x, #field
+  ///    Tangent: tan[y] = struct_extract tan[x], tan[#field]]
+  ///                             ^~~~~~~
+  ///                 field in tangent space corresponding to #field
+  void emitTangentForStructExtractInst(StructExtractInst *sei) {
+    assert(!sei->getField()->getAttrs().hasAttribute<NoDerivativeAttr>() &&
+           "`struct_extract` with `@noDerivative` field should not be "
+           "differentiated; activity analysis should not marked as varied");
+
+    auto diffBuilder = getDifferentialBuilder();
+    auto structTy = remapTypeInDifferential(
+        sei->getOperand()->getType()).getASTType();
+    auto tangentVectorTy =
+        getTangentSpace(structTy)->getType()->getCanonicalType();
+    assert(!getModule().Types.getTypeLowering(
+        tangentVectorTy, ResilienceExpansion::Minimal)
+            .isAddressOnly());
+    auto *tangentVectorDecl =
+        tangentVectorTy->getStructOrBoundGenericStruct();
+    assert(tangentVectorDecl);
+
+    // Get the tangent of the field and create the extract inst in the SIL
+    // of the differential.
+    // Find the corresponding field in the tangent space.
+    VarDecl *tanField = nullptr;
+    // If the tangent space is the original struct, then field is the same.
+    if (tangentVectorDecl == sei->getStructDecl())
+      tanField = sei->getField();
+    // Otherwise, look up the field by name.
+    else {
+      auto tanFieldLookup =
+      tangentVectorDecl->lookupDirect(sei->getField()->getName());
+      if (tanFieldLookup.empty()) {
+        context.emitNondifferentiabilityError(
+            sei, invoker,
+            diag::autodiff_stored_property_no_corresponding_tangent,
+            sei->getStructDecl()->getNameStr(),
+            sei->getField()->getNameStr());
+        errorOccurred = true;
+        return;
+      }
+      tanField = cast<VarDecl>(tanFieldLookup.front());
+    }
+
+    // Get the Tangent of the operand (the struct)
+    auto tanOperand =
+        materializeTangent(getTangentValue(sei->getOperand()), sei->getLoc());
+
+    // Emit the instruction
+    auto tangentExtractInst =
+        diffBuilder.createStructExtract(sei->getLoc(), tanOperand, tanField);
+
+    // Add tangent for original result into value mapping.
+    auto tangentResult =  makeConcreteTangentValue(tangentExtractInst);
+    setTangentValue(sei->getParent(), sei, tangentResult);
+  }
+
+  /// Handle `load` instruction.
+  ///   Original: y = load x
+  ///    Tangent: tan[y] = load tan[x]
+  void emitTangentForLoadInst(LoadInst *li) {
+    auto *bb = li->getParent();
+    auto diffBuilder = getDifferentialBuilder();
+
+    auto tanValSrc = getTangentBuffer(bb, li->getOperand());
+    auto *tanValDest = diffBuilder.createLoad(li->getLoc(), tanValSrc,
+        getBufferLOQ(li->getType().getASTType(),
+        getDifferential()));
+    setTangentValue(bb, li, makeConcreteTangentValue(tanValDest));
+  }
+
+  /// Handle `store` instruction in the differential.
+  ///   Original: store x to y
+  ///    Tangent: store tan[x] to tan[y]
+  void emitTangentForStoreInst(StoreInst *si) {
+    auto *bb = si->getParent();
+    auto &diffBuilder = getDifferentialBuilder();
+    auto tanValSrc = materializeTangent(getTangentValue(si->getSrc()),
+                                        si->getLoc());
+    auto tanValDest = getTangentBuffer(bb, si->getDest());
+    diffBuilder.createStore(si->getLoc(), tanValSrc, tanValDest,
+                            getBufferSOQ(tanValDest->getType().getASTType(),
+                                         getDifferential()));
+  }
+
+  /// Handle `copy_addr` instruction.
+  ///   Original: copy_addr x to y
+  ///    Tangent: copy_addr tan[x] to tan[y]
+  void emitTangentForCopyAddrInst(CopyAddrInst *cai) {
+    auto *diffGenEnv = getDifferential().getGenericEnvironment();
+    auto diffGenSig = diffGenEnv
+        ? diffGenEnv->getGenericSignature()->getCanonicalSignature()
+        : nullptr;
+    Lowering::GenericContextScope genericContextScope(
+        context.getTypeConverter(), diffGenSig);
+
+    auto diffBuilder = getDifferentialBuilder();
+    auto loc = cai->getLoc();
+    auto *bb = cai->getParent();
+    auto &tanSrc = getTangentBuffer(bb, cai->getSrc());
+    auto tanDest = getTangentBuffer(bb, cai->getDest());
+    if (errorOccurred)
+      return;
+
+    diffBuilder.createCopyAddr(loc, tanSrc, tanDest, cai->isTakeOfSrc(),
+                               cai->isInitializationOfDest());
+
+//    // Begin access, set the corresponding tangent buffer, and end access.
+//    auto *readAccess = diffBuilder.createBeginAccess(
+//        cai->getLoc(), adjDest, SILAccessKind::Read,
+//        SILAccessEnforcement::Static, /*noNestedConflict*/ true,
+//        /*fromBuiltin*/ false);
+//    setTangentBuffer(bb, cai->getSrc(), readAccess);
+//    diffBuilder.createEndAccess(cai->getLoc(), readAccess, /*aborted*/ false);
+  }
+
+  /// Handle `begin_access` instruction.
+  ///   Original: y = begin_access x
+  ///    Tangent: nothing (differentiability checks)
+  void emitTangentForBeginAccessInst(BeginAccessInst *bai) {
+    // Check for non-differentiable writes.
+    if (bai->getAccessKind() == SILAccessKind::Modify) {
+      if (auto *gai = dyn_cast<GlobalAddrInst>(bai->getSource())) {
+        context.emitNondifferentiabilityError(bai, invoker,
+            diag::autodiff_cannot_differentiate_writes_to_global_variables);
+        errorOccurred = true;
+        return;
+      }
+      if (auto *pbi = dyn_cast<ProjectBoxInst>(bai->getSource())) {
+        context.emitNondifferentiabilityError(bai, invoker,
+            diag::autodiff_cannot_differentiate_writes_to_mutable_captures);
+        errorOccurred = true;
+        return;
+      }
+    }
+  }
+
+  /// Add the value mapping and emit the same instruction.
+  void emitTangentForAllocStackInst(AllocStackInst *asi) {
+    auto &diffBuilder = getDifferentialBuilder();
+    auto *mappedAllocStackInst =
+        diffBuilder.createAllocStack(
+            asi->getLoc(), getRemappedTangentType(asi->getElementType()));
+    bufferMap.try_emplace({asi->getParent(), asi},
+                          mappedAllocStackInst);
+  }
+
+  /// Emit the same instruction but on the tangent instead.
+  void emitTangentForDeallocStackInst(DeallocStackInst *dsi) {
+    auto &diffBuilder = getDifferentialBuilder();
+    auto tanBuffer = getTangentBuffer(dsi->getParent(), dsi->getOperand());
+    diffBuilder.createDeallocStack(dsi->getLoc(), tanBuffer);
+  }
+
+  void emitTangentForStructInst(StructInst *si) {
+    auto diffBuilder = getDifferentialBuilder();
+    auto *bb = si->getParent();
+    auto loc = si->getLoc();
+    SmallVector<SILValue, 4> tangentElements;
+    for (auto elem : si->getElements())
+      tangentElements.push_back(getTangentValue(elem).getConcreteValue());
+
+    auto tanExtract = diffBuilder.createStruct(loc, si->getType(),
+                                               tangentElements);
+
+    setTangentValue(bb, si, makeConcreteTangentValue(tanExtract));
+  }
+
+  void emitTangentForTupleInst(TupleInst *ti) {
+    auto *bb = ti->getParent();
+    auto loc = ti->getLoc();
+    auto diffBuilder = getDifferentialBuilder();
+
+    // Get the tangents of all the tuple elements.
+    SmallVector<SILValue, 8> tangentTupleElements;
+    for (auto elem : ti->getElements()) {
+      tangentTupleElements.push_back(
+          materializeTangent(getTangentValue(elem), loc));
+    }
+
+    // Emit the instruction and add the tangent mapping.
+    auto tanTuple = diffBuilder.createTuple(ti->getLoc(), tangentTupleElements);
+    setTangentValue(bb, ti, makeConcreteTangentValue(tanTuple));
+  }
+
+  void emitTangentForArrayInitializationInst(ApplyInst *ai) {
+    auto indices = getIndices();
+    auto *bb = ai->getParent();
+    auto loc = ai->getLoc();
+    auto &diffBuilder = getDifferentialBuilder();
+
+    assert(ai->getNumArguments() == 1);
+
+    // Step 1: Clone array size operand
+    // TODO: add cast assertion?
+    auto arraySizeOperand = cast<IntegerLiteralInst>(ai->getArgument(0));
+    auto integerLiteral = diffBuilder.createIntegerLiteral(
+        loc, arraySizeOperand->getType(), arraySizeOperand->getValue());
+    SmallVector<SILValue, 8> args;
+    args.push_back(integerLiteral);
+
+    // Step 2: Apply _allocateUninitializedArray<A>, but remapping the
+    // substitution map to use τ_0_0.TangentVector.
+//    auto remappedSubs = ai->getSubstitutionMap().subst(
+//        getDifferential().getForwardingSubstitutionMap());
+
+    // If the original `apply` instruction has a substitution map, then the
+    // applied function is specialized.
+    // In the differential, specialization is also necessary for parity. The
+    // original function operand is specialized with a remapped version of same
+    // substitution map using an argument-less `partial_apply`.
+    SILValue diffArrayInitFuncRef =
+        diffBuilder.createFunctionRefFor(loc, ai->getCalleeFunction());
+    auto remappedSubs = remapSubstitutionMapInDifferential(
+        ai->getSubstitutionMap());
+    if (!ai->getSubstitutionMap().empty()) {
+      diffArrayInitFuncRef = diffBuilder.createPartialApply(
+          ai->getLoc(), diffArrayInitFuncRef, remappedSubs, {},
+          ParameterConvention::Direct_Guaranteed);
+    }
+    auto *diffArrayInitInst =
+        diffBuilder.createApply(loc, diffArrayInitFuncRef, SubstitutionMap(), args);
+
+    // Step 3: Create the non-active `tuple_extract` instruction for the
+    // array pointer (second element in tuple).
+    auto *diffArray =
+        diffBuilder.createTupleExtract(loc, diffArrayInitInst, 0);
+    auto *diffRawPointerInst =
+        diffBuilder.createTupleExtract(loc, diffArrayInitInst, 1);
+
+    // Step 4: Get the `DifferentiableView` of the array.
+    SmallVector<SILValue, 8> diffArgs;
+    diffArgs.push_back(diffArray);
+    auto diffArrayViewType = getRemappedTangentType(ai->getType()).getASTType();
+    auto metatypeType = CanMetatypeType::get(
+        diffArrayViewType, MetatypeRepresentation::Thin);
+    auto metatype = diffBuilder.createMetatype(
+        loc, SILType::getPrimitiveObjectType(metatypeType));
+    diffArgs.push_back(metatype);
+    // Allocate memory for a `DifferentiableView` and add to the differential
+    // arguments for the creation of the returned `DifferentiableView`.
+    auto typeDecl = diffArrayViewType->getStructOrBoundGenericStruct();
+    auto candidates = typeDecl->lookupDirect(DeclBaseName::createConstructor());
+    // Remove any initializer with argument lables, leaving `init(_:)`.
+    llvm::erase_if(candidates, [](ValueDecl *v) {
+      return llvm::any_of(v->getFullName().getArgumentNames(), [](Identifier id) {
+        return !id.empty();
+      });
+    });
+    assert(candidates.size() == 1 &&
+           "Expected single `DifferentiableView` intializer");
+    auto initDecl = cast<ConstructorDecl>(candidates.front());
+    SILDeclRef initRef(initDecl, SILDeclRef::Kind::Allocator);
+
+    // Get a function reference to the `DifferentiableView` intializer.
+    SILOptFunctionBuilder fb(context.getTransform());
+    auto *initFn = fb.getOrCreateFunction(
+        ai->getLoc(), initRef, NotForDefinition);
+    SILValue diffViewInitFuncRef = diffBuilder.createFunctionRefFor(ai->getLoc(), initFn);
+
+    // Because the `DifferentiableView` intializer is generic, we need to
+    // create our own substitution map to replace the generic element type
+    // with a concrete type.
+    // Grab the concret element type.
+    auto elementType = getRemappedTangentASTType(
+        ai->getType().getAs<TupleType>()->getElement(0).getType()
+        ->getAs<BoundGenericStructType>()->getGenericArgs().front());
+    // Grab the `Differentiable` protocol conformance we will need the
+    // generic type to conform to.
+    auto swiftModule = getModule().getSwiftModule();
+    auto diffProto =
+        getASTContext().getProtocol(KnownProtocolKind::Differentiable);
+    auto diffConf = swiftModule->lookupConformance(
+        elementType, diffProto);
+    ArrayRef<ProtocolConformanceRef> conformances = {*diffConf};
+    // Get the `DifferentiableView` intializer's generic signature.
+    auto genericSig = diffViewInitFuncRef->getType().castTo<SILFunctionType>()
+        ->getGenericSignature();
+    // Create the substitution map and apply the generic initializer with it in
+    // order to get the concrete `DifferentiableView` which will have the same
+    // element type as the original `Array`.
+    auto subs = SubstitutionMap::get(
+        genericSig, {elementType}, conformances);
+    auto *diffViewInitInst =
+        diffBuilder.createApply(loc, diffViewInitFuncRef, subs,
+                                diffArgs);
+
+    // Add value map between `Array` init tuple and `DifferentiableView`.
+    setTangentValue(bb, ai, makeConcreteTangentValue(diffViewInitInst));
+
+    // Loop over all uses of the array initialization, making sure to handle
+    // any `tuple_extract` instructions. These instructions can either be
+    // for getting the array, or the `RawPointer`. We are only interested in
+    // adding additional instructions for the `RawPointer`, the second element
+    // in the array tuple as the array is already handled through it being
+    // chosen to be differentiated when using activity analysis.
+    for (auto aiUse : ai->getUses()) {
+      auto tei = dyn_cast<TupleExtractInst>(aiUse->getUser()->getResult(0));
+      // Only handle the `RawPointer` instructions.
+      if (!tei || tei->getFieldNo() != 1) continue;
+
+      // TODO: might not need a loop since there should be one use of `RawPointer`.
+      // Get the `pointer_to_address` instruction which is the instruction
+      // that wraps the `RawPointer` in order to do subsequent instructions
+      for (auto teiUse : tei->getUses()) {
+        // Add tangent map between the `pointer_to_address` result.
+        // TODO: add cast assertion?
+        auto pointerAddrInst = dyn_cast<PointerToAddressInst>(teiUse->getUser()->getResult(0));
+        assert(pointerAddrInst && "RawPointer only use should be a "
+                                  "'pointer_to_address' instruction");
+        auto originalResult =
+            pointerAddrInst->getResults()[indices.source];
+        auto tangentPointerAddrInst = diffBuilder.createPointerToAddress(
+            loc, diffRawPointerInst, pointerAddrInst->getType(),
+            pointerAddrInst->isStrict());
+        auto differentialResult = tangentPointerAddrInst
+            ->SILInstruction::getResults()[indices.source];
+        // Add tangent for original result.
+        // TODO: what about indirect results?
+        assert(indices.source == 0 && "Expected result index to be first.");
+        setTangentBuffer(bb, originalResult, differentialResult);
+
+        // Handle the uses of the array pointer which can be:
+        // - `StoreInst`
+        // - `CopyAddrInst`
+        // - `IndexAddrInst`
+//        for (auto pointerUse : teiUse->getUser()->getResult(0)->getUses()) {
+//          auto inst = pointerUse->getUser();
+//          if (auto si = dyn_cast<StoreInst>(inst)) {
+//            emitTangentForStoreInst(si);
+//          } else if (auto cai = dyn_cast<CopyAddrInst>(inst)) {
+//            llvm_unreachable("Can't handle 'copy_addr' instruction for "
+//                             "array yet");
+//          } else if (auto iai = dyn_cast<IndexAddrInst>(inst)) {
+//            llvm_unreachable("Can't handle 'index_addr' instruction for "
+//                             "array yet");
+//          }
+//        }
+      }
+    }
+
+  }
+
+  void emitTangentForTupleElementAddrInst(TupleElementAddrInst *teai) {
+    auto *bb = teai->getParent();
+    auto &diffBuilder = getDifferentialBuilder();
+    auto origTupleTy = teai->getOperand()->getType().castTo<TupleType>();
+    unsigned tanIndex = 0;
+    for (unsigned i : range(teai->getFieldNo())) {
+      if (getTangentSpace(
+              origTupleTy->getElement(i).getType()->getCanonicalType()))
+        ++tanIndex;
+    }
+    auto tanType = getRemappedTangentType(teai->getType());
+    auto tanSource = getTangentBuffer(bb, teai->getOperand());
+    SILValue tanBuffer;
+    // If the tangent buffer of the source does not have a tuple type, then
+    // it must represent a "single element tuple type". Use it directly.
+    if (!tanSource->getType().is<TupleType>()) {
+      tanBuffer = tanSource;
+    } else {
+      tanBuffer = diffBuilder.createTupleElementAddr(
+          teai->getLoc(), tanSource, tanIndex, tanType);
+    }
+    bufferMap.try_emplace({teai->getParent(), teai}, tanBuffer);
+  }
+
+  void emitTangentForTupleExtractInst(TupleExtractInst *teai) {
+    auto loc = teai->getLoc();
+    auto &diffBuilder = getDifferentialBuilder();
+    auto origTupleTy = teai->getOperand()->getType().castTo<TupleType>();
+    unsigned tanIndex = 0;
+    for (unsigned i : range(teai->getFieldNo())) {
+      if (getTangentSpace(
+              origTupleTy->getElement(i).getType()->getCanonicalType()))
+        ++tanIndex;
+    }
+    auto tanType = getRemappedTangentType(teai->getType());
+    auto tanSource = materializeTangent(
+        getTangentValue(teai->getOperand()), loc);
+    SILValue tanBuffer;
+    // If the tangent buffer of the source does not have a tuple type, then
+    // it must represent a "single element tuple type". Use it directly.
+    if (!tanSource->getType().is<TupleType>()) {
+      setTangentValue(teai->getParent(), teai,
+                      makeConcreteTangentValue(tanSource));
+    } else {
+      tanBuffer = diffBuilder.createTupleExtract(
+           loc, tanSource, tanIndex, tanType);
+      bufferMap.try_emplace({teai->getParent(), teai}, tanBuffer);
+    }
+  }
+
+  void startDifferentialGeneration() {
+    // Create differential blocks and arguments.
+    // TODO: Consider visiting original blocks in pre-order (dominance) order.
+    auto *diffGenEnv = getDifferential().getGenericEnvironment();
+    auto diffGenSig = diffGenEnv
+        ? diffGenEnv->getGenericSignature()->getCanonicalSignature()
+        : nullptr;
+    auto &differential = getDifferential();
+    auto *origEntry = original->getEntryBlock();
+    for (auto &origBB : *original) {
+      auto *diffBB = differential.createBasicBlock();
+      diffBBMap.insert({&origBB, diffBB});
+      {
+        Lowering::GenericContextScope genericContextScope(
+            context.getTypeConverter(), diffGenSig);
+        auto diffStructLoweredType =
+            remapTypeInDifferential(
+                differentialInfo.getLinearMapStructLoweredType(&origBB));
+
+        // If the BB is the original entry, then the differential block that we
+        // just created must be the differential function's entry. Create
+        // differential entry arguments and continue.
+        if (&origBB == origEntry) {
+          assert(diffBB->isEntry());
+          createEntryArguments(&differential);
+          auto *lastArg = diffBB->getArguments().back();
+          assert(lastArg->getType() == diffStructLoweredType);
+          // auto remappedDiffStructType = differential.mapTypeIntoContext(lastArg->getType());
+          // assert(remappedDiffStructType == diffStructLoweredType);
+          differentialStructArguments[&origBB] = lastArg;
+        }
+      }
+
+      LLVM_DEBUG({
+        auto &s = getADDebugStream()
+                  << "Original bb" + std::to_string(origBB.getDebugID())
+                  << ": To differentiate or not to differentiate?\n";
+        for (auto &inst : origBB) {
+          s << (shouldBeDifferentiated(&inst, getIndices()) ? "[∂] " : "[ ] ")
+            << inst;
+        }
+      });
+    }
+
+    assert(diffBBMap.size() == 1
+           && "Can only currently handle single basic block functions");
+
+    // The differential function has type:
+    // (arg0', ..., argn', exit_diffs) -> result'.
+    auto &diffBuilder = getDifferentialBuilder();
+    auto diffParamArgs =
+        differential.getArgumentsWithoutIndirectResults().drop_back();
+    assert(diffParamArgs.size() ==
+           attr->getIndices().parameters->getNumIndices());
+    auto origParamArgs = original->getArgumentsWithoutIndirectResults();
+
+    // Check if result is not varied.
+    SmallVector<SILValue, 8> origFormalResults;
+    collectAllFormalResultsInTypeOrder(*original, origFormalResults);
+    auto origResult = origFormalResults[getIndices().source];
+    // Emit warning if original result is not varied, because it will always
+    // have a zero derivative.
+    if (!activityInfo.isVaried(origResult, getIndices().parameters)) {
+      // Emit fixit if original result has a valid source location.
+      auto startLoc = origResult.getLoc().getStartSourceLoc();
+      auto endLoc = origResult.getLoc().getEndSourceLoc();
+      if (startLoc.isValid() && endLoc.isValid()) {
+        context.diagnose(startLoc, diag::autodiff_nonvaried_result_fixit)
+            .fixItInsert(startLoc, "withoutDerivative(at:")
+            .fixItInsertAfter(endLoc, ")");
+      }
+    }
+
+    auto *diffEntry = getDifferential().getEntryBlock();
+    auto diffLoc = getDifferential().getLocation();
+    diffBuilder.setInsertionPoint(
+        diffEntry, getNextDifferentialLocalAllocationInsertionPoint());
+
+    // Create a mapping of the parameters
+    for (auto index : *getIndices().parameters) {
+      auto *diffParam = diffParamArgs[index];
+      auto *origParam = origParamArgs[index];
+      if (diffParam->getType().isAddress()) {
+        setTangentBuffer(origEntry, origParam, diffParam);
+      } else {
+        diffBuilder.createRetainValue(diffLoc, diffParam,
+                                      diffBuilder.getDefaultAtomicity());
+        setTangentValue(
+            origEntry, origParam, makeConcreteTangentValue(diffParam));
+      }
+      LLVM_DEBUG(getADDebugStream()
+                 << "Assigned parameter " << *diffParam
+                 << " as the tangent of original result " << *origParam);
+    }
+
+    // If there are indirect results, create a mapping
+    auto origIndResults = original->getIndirectResults();
+    auto diffIndResults = differential.getIndirectResults();
+    assert(origIndResults.size() == diffIndResults.size());
+
+    for (auto &origBB : *original) {
+      for (auto i : range(diffIndResults.size())) {
+        setTangentBuffer(&origBB, origIndResults[i], diffIndResults[i]);
+      }
+    }
+  }
+
+public:
+  explicit JVPEmitter(ADContext &context, SILFunction *original,
+                      SILDifferentiableAttr *attr, SILFunction *jvp,
+                      DifferentiationInvoker invoker)
+      : TypeSubstCloner(*jvp, *original, getSubstitutionMap(original, jvp)),
+        context(context), original(original), attr(attr), jvp(jvp),
+        invoker(invoker), activityInfo(getActivityInfo(
+                              context, original, attr->getIndices(), jvp)),
+        differentialInfo(context, AutoDiffAssociatedFunctionKind::JVP, original,
+                         jvp, attr->getIndices(), activityInfo, getBuilder()),
+        differentialAndBuilder(initializeDifferentialAndBuilder(
+            context, original, attr, &differentialInfo)),
+        diffLocalAllocBuilder(getDifferential()) {
+    // Get JVP generic signature.
+    CanGenericSignature jvpGenSig = nullptr;
+    if (auto *jvpGenEnv = jvp->getGenericEnvironment())
+      jvpGenSig = jvpGenEnv->getGenericSignature()->getCanonicalSignature();
+    // Create empty differential function.
+    context.getGeneratedFunctions().push_back(&getDifferential());
+  }
+
+  static SILFunction *createEmptyDifferential(ADContext &context,
+                                              SILFunction *original,
+                                              SILDifferentiableAttr *attr,
+                                              LinearMapInfo *linearMapInfo) {
+    auto &module = context.getModule();
+    auto origTy = original->getLoweredFunctionType();
+    auto lookupConformance = LookUpConformanceInModule(module.getSwiftModule());
+
+    // RAII that pushes the original function's generic signature to
+    // `module.Types` so that calls to `module.Types.getTypeLowering()` below
+    // will know the original function's generic parameter types.
+    Lowering::GenericContextScope genericContextScope(
+        module.Types, origTy->getGenericSignature());
+
+    // Parameters of the differential are:
+    // - the tangent vectors of the parameters we are differentiating with
+    //   respect to
+    // - a differential struct
+    // Result of the differential is in the tangent space of the original
+    // result.
+    SmallVector<SILParameterInfo, 8> dfParams;
+    SmallVector<SILResultInfo, 8> dfResults;
+    auto origParams = origTy->getParameters();
+    auto indices = attr->getIndices();
+
+    // Add differential results.
+    auto origResInfo = origTy->getResults()[indices.source];
+    dfResults.push_back(
+        SILResultInfo(origResInfo.getType()
+                          ->getAutoDiffAssociatedTangentSpace(lookupConformance)
+                          ->getCanonicalType(),
+                      origResInfo.getConvention()));
+
+    // Add differential parameters for the requested wrt parameters.
+    for (auto i : indices.parameters->getIndices()) {
+      auto origParam = origParams[i];
+      dfParams.push_back(SILParameterInfo(
+          origParam.getType()
+              ->getAutoDiffAssociatedTangentSpace(lookupConformance)
+              ->getCanonicalType(),
+          origParam.getConvention()));
+    }
+
+    // Accept a differential struct in the differential parameter list. This is
+    // the returned differential's closure context.
+    auto *origEntry = original->getEntryBlock();
+    auto *dfStruct = linearMapInfo->getLinearMapStruct(origEntry);
+    auto dfStructType =
+        dfStruct->getDeclaredInterfaceType()->getCanonicalType();
+    dfParams.push_back({dfStructType, ParameterConvention::Direct_Guaranteed});
+
+    auto diffName = original->getASTContext()
+        .getIdentifier("AD__" + original->getName().str() +
+                       "__differential_" + indices.mangle())
+        .str();
+    auto diffGenericSig = getAssociatedFunctionGenericSignature(attr, original);
+    auto *diffGenericEnv =
+        diffGenericSig ? diffGenericSig->createGenericEnvironment() : nullptr;
+    auto diffType = SILFunctionType::get(
+        diffGenericSig, origTy->getExtInfo(), origTy->getCoroutineKind(),
+        origTy->getCalleeConvention(), dfParams, {}, dfResults, None,
+        original->getASTContext());
+
+    SILOptFunctionBuilder fb(context.getTransform());
+    // The generated tangent linkage is set to Hidden because generated tangent
+    // are never called cross-module.
+    auto linkage = SILLinkage::Hidden;
+    auto *differential = fb.createFunction(
+        linkage, diffName, diffType, diffGenericEnv, original->getLocation(),
+        original->isBare(), IsNotTransparent, original->isSerialized(),
+        original->isDynamicallyReplaceable());
+    differential->setOwnershipEliminated();
+    differential->setDebugScope(
+        new (module) SILDebugScope(original->getLocation(), differential));
+
+    return differential;
+  }
+
+  /// Run JVP generation. Returns true on error.
+  bool run() {
+    LLVM_DEBUG(getADDebugStream()
+               << "Cloning original @" << original->getName()
+               << " to jvp @" << jvp->getName() << '\n');
+    // Create JVP and differential entry and arguments.
+    auto *entry = jvp->createBasicBlock();
+    createEntryArguments(jvp);
+    startDifferentialGeneration();
+    // Clone.
+    SmallVector<SILValue, 4> entryArgs(entry->getArguments().begin(),
+                                       entry->getArguments().end());
+    cloneFunctionBody(original, entry, entryArgs);
+    emitReturnInstForDifferential();
+    // If errors occurred, back out.
+    if (errorOccurred)
+      return true;
+    LLVM_DEBUG(getADDebugStream() << "Generated JVP for "
+               << original->getName() << ":\n" << *jvp);
+    LLVM_DEBUG(getADDebugStream() << "Generated differential for "
+               << original->getName() << ":\n" << getDifferential());
+    return errorOccurred;
+  }
+
+  void visit(SILInstruction *inst) {
+    auto diffBuilder = getDifferentialBuilder();
+    if (errorOccurred)
+      return;
+    if (shouldBeDifferentiated(inst, getIndices())) {
+      LLVM_DEBUG(getADDebugStream() << "JVPEmitter visited:\n[ORIG]"
+                 << *inst);
+#ifndef NDEBUG
+      auto beforeInsertion = std::prev(diffBuilder.getInsertionPoint());
+#endif
+      SILInstructionVisitor::visit(inst); // TypeSubstCloner::visit(inst);
+      LLVM_DEBUG({
+        auto &s = llvm::dbgs() << "[DF] Emitted in Differential:\n";
+        auto afterInsertion = diffBuilder.getInsertionPoint();
+        for (auto it = ++beforeInsertion; it != afterInsertion; ++it)
+          s << *it;
+      });
+    } else {
+      SILInstructionVisitor::visit(inst); // TypeSubstCloner::visit(inst);
+    }
+  }
+
+  void postProcess(SILInstruction *orig, SILInstruction *cloned) {
+    if (errorOccurred)
+      return;
+    SILClonerWithScopes::postProcess(orig, cloned);
+  }
+
+  /// Remap original basic blocks.
+  SILBasicBlock *remapBasicBlock(SILBasicBlock *bb) {
+    auto *jvpBB = BBMap[bb];
+    return jvpBB;
+  }
+
+  void visitArrayInitializationInst(ApplyInst *ai) {
+    TypeSubstCloner::visitApplyInst(ai);
+    emitTangentForArrayInitializationInst(ai);
+  }
+
+  // If an `apply` has active results or active inout parameters, replace it
+  // with an `apply` of its JVP.
+  void visitApplyInst(ApplyInst *ai) {
+    // Handle array uninitialized allocation intrinsic specially.
+//    if (ai->hasSemantics("array.uninitialized_intrinsic")) {
+//      return visitArrayInitializationInst(ai);
+//    }
+
+    // Special handling logic only applies when `apply` has active results or
+    // active arguments at an active parameter position. If not, just do
+    // standard cloning.
+    SmallVector<SILValue, 4> allResults;
+    allResults.push_back(ai);
+    allResults.append(ai->getIndirectSILResults().begin(),
+                      ai->getIndirectSILResults().end());
+    auto hasActiveResults = llvm::any_of(allResults, [this](SILValue res) {
+      return activityInfo.isActive(res, getIndices());
+    });
+    auto hasActiveArguments = llvm::any_of(
+        ai->getArgumentsWithoutIndirectResults(), [this](SILValue arg) {
+      return activityInfo.isActive(arg, getIndices());
+    });
+    // Check for active 'inout' arguments.
+    auto paramInfos = ai->getSubstCalleeConv().getParameters();
+    for (unsigned i : swift::indices(paramInfos)) {
+      if (paramInfos[i].isIndirectInOut() &&
+          activityInfo.isActive(ai->getArgumentsWithoutIndirectResults()[i],
+                                getIndices())) {
+        // Reject functions with active inout arguments. It's not yet supported.
+        context.emitNondifferentiabilityError(
+            ai, invoker,
+            diag::autodiff_cannot_differentiate_through_inout_arguments);
+        errorOccurred = true;
+        return;
+      }
+    }
+
+    // If there's no active results, this function should not be differentiated.
+    // Do standard cloning.
+    if (!hasActiveResults || !hasActiveArguments) {
+      LLVM_DEBUG(getADDebugStream()
+                 << "No active results nor active arguments:\n"
+                 << *ai << '\n');
+      TypeSubstCloner::visitApplyInst(ai);
+      return;
+    }
+
+    // Get the parameter indices required for differentiating this function.
+    LLVM_DEBUG(getADDebugStream() << "JVP-transforming:\n" << *ai << '\n');
+    SmallVector<unsigned, 8> activeParamIndices;
+    SmallVector<unsigned, 8> activeResultIndices;
+    collectMinimalIndicesForFunctionCall(ai, allResults, getIndices(),
+                                         activityInfo, activeParamIndices,
+                                         activeResultIndices);
+    assert(!activeParamIndices.empty() && "Parameter indices cannot be empty");
+    assert(!activeResultIndices.empty() && "Result indices cannot be empty");
+    LLVM_DEBUG(auto &s = getADDebugStream() << "Active indices: params={";
+               interleave(activeParamIndices.begin(), activeParamIndices.end(),
+                          [&s](unsigned i) { s << i; }, [&s] { s << ", "; });
+               s << "}, results={"; interleave(
+                   activeResultIndices.begin(), activeResultIndices.end(),
+                   [&s](unsigned i) { s << i; }, [&s] { s << ", "; });
+               s << "}\n";);
+    // FIXME: We don't support multiple active results yet.
+    if (activeResultIndices.size() > 1) {
+      context.emitNondifferentiabilityError(
+          ai, invoker, diag::autodiff_expression_not_differentiable_note);
+      errorOccurred = true;
+      return;
+    }
+
+    // Form expected indices by assuming there's only one result.
+    SILAutoDiffIndices indices(
+        activeResultIndices.front(),
+        AutoDiffIndexSubset::get(
+            getASTContext(), ai->getArgumentsWithoutIndirectResults().size(),
+            activeParamIndices));
+
+    // Emit the JVP.
+    auto loc = ai->getLoc();
+    auto &builder = getBuilder();
+    auto original = getOpValue(ai->getCallee());
+    auto functionSource = original;
+    SILValue jvpValue;
+    // If functionSource is a @differentiable function, just extract it.
+    auto originalFnTy = original->getType().castTo<SILFunctionType>();
+    if (originalFnTy->isDifferentiable()) {
+      auto paramIndices = originalFnTy->getDifferentiationParameterIndices();
+      for (auto i : indices.parameters->getIndices()) {
+        if (!paramIndices->contains(i)) {
+          context.emitNondifferentiabilityError(original, invoker,
+              diag::autodiff_function_nondiff_parameter_not_differentiable);
+          errorOccurred = true;
+          return;
+        }
+      }
+      jvpValue = builder.createAutoDiffFunctionExtract(
+          loc, AutoDiffFunctionExtractInst::Extractee::JVP,
+          /*differentiationOrder*/ 1, functionSource);
+    }
+
+    // Check and diagnose non-differentiable arguments.
+    for (unsigned paramIndex : range(originalFnTy->getNumParameters())) {
+      if (indices.isWrtParameter(paramIndex) &&
+              !originalFnTy->getParameters()[paramIndex]
+              .getSILStorageType()
+              .isDifferentiable(getModule())) {
+        context.emitNondifferentiabilityError(
+            original, invoker, diag::autodiff_nondifferentiable_argument);
+        errorOccurred = true;
+        return;
+      }
+    }
+
+    // Check and diagnose non-differentiable results.
+    if (!originalFnTy->getResults()[indices.source]
+            .getSILStorageType()
+            .isDifferentiable(getModule())) {
+      context.emitNondifferentiabilityError(
+          original, invoker, diag::autodiff_nondifferentiable_result);
+      errorOccurred = true;
+      return;
+    }
+
+    // If JVP has not yet been found, emit an `autodiff_function` instruction
+    // on the remapped original function operand and `autodiff_function_extract`
+    // the JVP. The actual JVP functions will be populated in the
+    // `autodiff_function` during the transform main loop.
+    SILValue differentiableFunc;
+    if (!jvpValue) {
+      // FIXME: Handle indirect differentiation invokers. This may require some
+      // redesign: currently, each original function + attribute pair is mapped
+      // only to one invoker.
+      /*
+       DifferentiationInvoker indirect(ai, attr);
+       auto insertion =
+           context.getInvokers().try_emplace({this->original, attr}, indirect);
+       auto &invoker = insertion.first->getSecond();
+       invoker = indirect;
+       */
+
+      // If the original `apply` instruction has a substitution map, then the
+      // applied function is specialized.
+      // In the JVP, specialization is also necessary for parity. The original
+      // function operand is specialized with a remapped version of same
+      // substitution map using an argument-less `partial_apply`.
+      if (ai->getSubstitutionMap().empty()) {
+        builder.createRetainValue(loc, original, builder.getDefaultAtomicity());
+      } else {
+        auto substMap = getOpSubstitutionMap(ai->getSubstitutionMap());
+        auto jvpPartialApply = getBuilder().createPartialApply(
+            ai->getLoc(), original, substMap, {},
+            ParameterConvention::Direct_Guaranteed);
+        original = jvpPartialApply;
+      }
+
+      auto *autoDiffFuncInst =
+          context.createAutoDiffFunction(builder, loc, indices.parameters,
+                                         /*differentiationOrder*/ 1, original);
+      differentiableFunc = autoDiffFuncInst;
+
+      // Record the `autodiff_function` instruction.
+      context.getAutoDiffFunctionInsts().push_back(autoDiffFuncInst);
+      context.getResultIndices()[autoDiffFuncInst] =
+          activeResultIndices.front();
+
+      jvpValue = builder.createAutoDiffFunctionExtract(
+          loc, AutoDiffFunctionExtractInst::Extractee::JVP,
+          /*differentiationOrder*/ 1, autoDiffFuncInst);
+    }
+
+    // Call the JVP using the original parameters.
+    SmallVector<SILValue, 8> jvpArgs;
+    auto jvpFnTy = getOpType(jvpValue->getType()).castTo<SILFunctionType>();
+    auto numJVPArgs =
+        jvpFnTy->getNumParameters() + jvpFnTy->getNumIndirectFormalResults();
+    jvpArgs.reserve(numJVPArgs);
+    // Collect substituted arguments.
+    for (auto origArg : ai->getArguments())
+      jvpArgs.push_back(getOpValue(origArg));
+    assert(jvpArgs.size() == numJVPArgs);
+    // Apply the JVP.
+    // The JVP should be specialized, so no substitution map is necessary.
+    auto *jvpCall = getBuilder().createApply(loc, jvpValue, SubstitutionMap(),
+                                             jvpArgs, ai->isNonThrowing());
+    LLVM_DEBUG(getADDebugStream() << "Applied jvp function\n" << *jvpCall);
+
+    // Release the differentiable function.
+    if (differentiableFunc)
+      builder.createReleaseValue(loc, differentiableFunc,
+                                 builder.getDefaultAtomicity());
+
+    // Get the JVP results (original results and differential).
+    SmallVector<SILValue, 8> jvpDirectResults;
+    extractAllElements(jvpCall, builder, jvpDirectResults);
+    auto originalDirectResults =
+        ArrayRef<SILValue>(jvpDirectResults).drop_back(1);
+    auto originalDirectResult =
+        joinElements(originalDirectResults, getBuilder(), jvpCall->getLoc());
+
+    mapValue(ai, originalDirectResult);
+
+    // Some instructions that produce the callee may have been cloned.
+    // If the original callee did not have any users beyond this `apply`,
+    // recursively kill the cloned callee.
+    if (auto *origCallee = cast_or_null<SingleValueInstruction>(
+            ai->getCallee()->getDefiningInstruction()))
+      if (origCallee->hasOneUse())
+        recursivelyDeleteTriviallyDeadInstructions(
+            getOpValue(origCallee)->getDefiningInstruction());
+
+    // Add the differential function for when we create the struct we partially
+    // apply to the differential we are generating.
+    auto differential = jvpDirectResults.back();
+    auto *differentialDecl = differentialInfo.lookUpLinearMapDecl(ai);
+    auto originalDifferentialType =
+        getOpType(differential->getType()).getAs<SILFunctionType>();
+    auto differentialType =
+        remapType(differential->getType())
+            .castTo<SILFunctionType>();
+    auto jvpGenSig = SubsMap.getGenericSignature()
+        ? SubsMap.getGenericSignature()->getCanonicalSignature()
+        : nullptr;
+    Lowering::GenericContextScope genericContextScope(
+        context.getTypeConverter(), jvpGenSig);
+    auto loweredDifferentialType =
+        getOpType(context.getTypeConverter().getLoweredType(
+            differentialDecl->getInterfaceType()->getCanonicalType(),
+            ResilienceExpansion::Minimal))
+            .castTo<SILFunctionType>();
+    // If actual differential type does not match lowered differential type,
+    // reabstract the differential using a thunk.
+    if (!loweredDifferentialType->isEqual(originalDifferentialType)) {
+      SILOptFunctionBuilder fb(context.getTransform());
+      auto *thunk = getOrCreateReabstractionThunk(
+          fb, context.getModule(), loc, &getDifferential(),
+          differentialType, loweredDifferentialType);
+      auto *thunkRef = builder.createFunctionRef(loc, thunk);
+      differential = builder.createPartialApply(
+          loc, thunkRef,
+          getOpSubstitutionMap(thunk->getForwardingSubstitutionMap()),
+          {differential}, differentialType->getCalleeConvention());
+    }
+    differentialValues[ai->getParent()].push_back(differential);
+
+    // Differential emission.
+    emitTangentForApplyInst(ai, indices, originalDifferentialType);
+  }
+
+  void visitReturnInst(ReturnInst *ri) {
+    auto loc = ri->getOperand().getLoc();
+    auto *origExit = ri->getParent();
+    auto &builder = getBuilder();
+    auto *diffStructVal = buildDifferentialValueStructValue(ri);
+
+    // Get the JVP value corresponding to the original functions's return value.
+    auto *origRetInst = cast<ReturnInst>(origExit->getTerminator());
+    auto origResult = getOpValue(origRetInst->getOperand());
+    SmallVector<SILValue, 8> origResults;
+    extractAllElements(origResult, builder, origResults);
+
+    // Get and partially apply the differential.
+    auto jvpGenericEnv = jvp->getGenericEnvironment();
+    auto jvpSubstMap = jvpGenericEnv
+        ? jvpGenericEnv->getForwardingSubstitutionMap()
+        : jvp->getForwardingSubstitutionMap();
+    auto *differentialRef =
+        builder.createFunctionRef(loc, &getDifferential());
+    auto *differentialPartialApply = builder.createPartialApply(
+        loc, differentialRef, jvpSubstMap, {diffStructVal},
+        ParameterConvention::Direct_Guaranteed);
+
+    // Return a tuple of the original result and pullback.
+    SmallVector<SILValue, 8> directResults;
+    directResults.append(origResults.begin(), origResults.end());
+    directResults.push_back(differentialPartialApply);
+    builder.createReturn(
+        ri->getLoc(), joinElements(directResults, builder, loc));
+  }
+
+  void visitLoadInst(LoadInst *li) {
+    TypeSubstCloner::visitLoadInst(li);
+    if (shouldBeDifferentiated(li, getIndices()))
+      emitTangentForLoadInst(li);
+  }
+
+  void visitStoreInst(StoreInst *si) {
+    TypeSubstCloner::visitStoreInst(si);
+    if (shouldBeDifferentiated(si, getIndices()))
+      emitTangentForStoreInst(si);
+  }
+
+  void visitCopyAddrInst(CopyAddrInst *cai) {
+    TypeSubstCloner::visitCopyAddrInst(cai);
+    if (shouldBeDifferentiated(cai, getIndices()))
+      emitTangentForCopyAddrInst(cai);
+  }
+
+  void visitBeginAccessInst(BeginAccessInst *bai) {
+    TypeSubstCloner::visitBeginAccessInst(bai);
+    if (shouldBeDifferentiated(bai, getIndices()))
+      emitTangentForBeginAccessInst(bai);
+  }
+
+  void visitAllocStackInst(AllocStackInst *asi) {
+    TypeSubstCloner::visitAllocStackInst(asi);
+    if (shouldBeDifferentiated(asi, getIndices()))
+      emitTangentForAllocStackInst(asi);
+  }
+
+  void visitDeallocStackInst(DeallocStackInst *dsi) {
+    TypeSubstCloner::visitDeallocStackInst(dsi);
+    if (shouldBeDifferentiated(dsi, getIndices()))
+      emitTangentForDeallocStackInst(dsi);
+  }
+
+  void visitStructExtractInst(StructExtractInst *sei) {
+    TypeSubstCloner::visitStructExtractInst(sei);
+    if (shouldBeDifferentiated(sei, getIndices()))
+      emitTangentForStructExtractInst(sei);
+  }
+
+  void visitStructInst(StructInst *si) {
+    TypeSubstCloner::visitStructInst(si);
+    if (shouldBeDifferentiated(si, getIndices()))
+      emitTangentForStructInst(si);
+  }
+
+  /// Handle `tuple` instruction.
+  ///   Original: y = tuple (x0, x1, x2, ...)
+  ///    Tangent: tan[y] = tuple (tan[x0], tan[x1], tan[x2], ...)
+  ///
+  void visitTupleInst(TupleInst *ti) {
+    TypeSubstCloner::visitTupleInst(ti);
+    if (shouldBeDifferentiated(ti, getIndices()))
+      emitTangentForTupleInst(ti);
+  }
+
+  /// Handle `tuple_extract` instruction.
+  ///   Original: y = tuple_element_addr x, <n>
+  ///    Tangent: tan[y] = tuple_element_addr tan[x], <n>
+  void visitTupleElementAddrInst(TupleElementAddrInst *teai) {
+    TypeSubstCloner::visitTupleElementAddrInst(teai);
+    if(shouldBeDifferentiated(teai, getIndices()))
+      emitTangentForTupleElementAddrInst(teai);
+  }
+
+  /// Handle `tuple_extract` instruction.
+  ///   Original: y = tuple_extract x, <n>
+  ///    Tangent: tan[y] = tuple_extract tan[x], <n>
+  void visitTupleExtractInst(TupleExtractInst *tei) {
+    TypeSubstCloner::visitTupleExtractInst(tei);
+    if(shouldBeDifferentiated(tei, getIndices()))
+      emitTangentForTupleExtractInst(tei);
+  }
+
+  void visitBranchInst(BranchInst *bi) {
+    llvm_unreachable("Unsupported SIL instruction.");
+  }
+
+  void visitCondBranchInst(CondBranchInst *cbi) {
+    llvm_unreachable("Unsupported SIL instruction.");
+  }
+
+  void visitSwitchEnumInst(SwitchEnumInst *sei) {
+    llvm_unreachable("Unsupported SIL instruction.");
+  }
+
+  void visitAutoDiffFunctionInst(AutoDiffFunctionInst *adfi) {
+    // Clone `autodiff_function` from original to JVP, then add the cloned
+    // instruction to the `autodiff_function` worklist.
+    TypeSubstCloner::visitAutoDiffFunctionInst(adfi);
+    auto *newADFI = cast<AutoDiffFunctionInst>(getOpValue(adfi));
+    context.getAutoDiffFunctionInsts().push_back(newADFI);
+  }
+
+  void visitSILInstruction(SILInstruction *inst) {
+    context.emitNondifferentiabilityError(inst, invoker,
+        diag::autodiff_expression_not_differentiable_note);
+    errorOccurred = true;
+  }
+};
+} // end anonymous namespace
+
 //===----------------------------------------------------------------------===//
 // PullbackEmitter - visitors on the original function for pullback code
 // generation
@@ -4150,6 +5644,7 @@ private:
   /// cleaned before processing another basic block.
   DenseMap<SILBasicBlock *, SmallVector<SILValue, 64>>
       blockTemporaries;
+
   llvm::DenseSet<SILValue> blockTemporarySet;
 
   /// Stack buffers allocated for storing local adjoint values.
@@ -4465,8 +5960,7 @@ private:
     // rather than after ensures that allocation and zero initialization
     // instructions are grouped together.
     auto lastLocalAlloc = functionLocalAllocations.back();
-    auto it = lastLocalAlloc->getDefiningInstruction()->getIterator();
-    return it;
+    return lastLocalAlloc->getDefiningInstruction()->getIterator();
   }
 
   SILValue &getAdjointBuffer(SILBasicBlock *origBB, SILValue originalBuffer) {
@@ -4546,7 +6040,7 @@ private:
   //--------------------------------------------------------------------------//
   // Other utilities
   //--------------------------------------------------------------------------//
-  
+
   bool shouldBeDifferentiated(SILInstruction *inst,
                               const SILAutoDiffIndices &indices) {
     // Anything with an active result should be differentiated.
@@ -4753,8 +6247,7 @@ public:
       auto startLoc = origResult.getLoc().getStartSourceLoc();
       auto endLoc = origResult.getLoc().getEndSourceLoc();
       if (startLoc.isValid() && endLoc.isValid()) {
-        getContext()
-            .diagnose(startLoc, diag::autodiff_nonvaried_result_fixit)
+        getContext().diagnose(startLoc, diag::autodiff_nonvaried_result_fixit)
             .fixItInsert(startLoc, "withoutDerivative(at:")
             .fixItInsertAfter(endLoc, ")");
       }
@@ -5320,10 +6813,10 @@ public:
     auto *pullbackCall = builder.createApply(
         loc, pullback, SubstitutionMap(), args, /*isNonThrowing*/ false);
 
-    // Extract all results from `pullbackCall`.
+    // Extract all direct results from the pullback.
     SmallVector<SILValue, 8> dirResults;
     extractAllElements(pullbackCall, builder, dirResults);
-    // Get all results in type-defined order.
+    // Get all pullback results in type-defined order.
     SmallVector<SILValue, 8> allResults;
     collectAllActualResultsInTypeOrder(
         pullbackCall, dirResults, pullbackCall->getIndirectSILResults(),
@@ -5560,7 +7053,7 @@ public:
   /// Handle `tuple_extract` instruction.
   ///   Original: y = tuple_extract x, <n>
   ///    Adjoint: adj[x] += tuple (0, 0, ..., adj[y], ..., 0, 0)
-  ///                                         ^~~~~~
+  ///                             ^~~~~~
   ///                            n'-th element, where n' is tuple tangent space
   ///                            index corresponding to n
   void visitTupleExtractInst(TupleExtractInst *tei) {
@@ -6131,25 +7624,6 @@ bool VJPEmitter::run() {
   return errorOccurred;
 }
 
-bool JVPEmitter::run() {
-  LLVM_DEBUG(getADDebugStream()
-             << "Cloning original @" << original->getName()
-             << " to jvp @" << jvp->getName() << '\n');
-  // Create entry BB and arguments.
-  auto *entry = jvp->createBasicBlock();
-  createEntryArguments(jvp);
-  SmallVector<SILValue, 4> entryArgs(entry->getArguments().begin(),
-                                     entry->getArguments().end());
-  cloneFunctionBody(original, entry, entryArgs);
-  // If errors occurred, back out.
-  if (errorOccurred)
-    return true;
-
-  LLVM_DEBUG(getADDebugStream() << "Generated JVP for "
-             << original->getName() << ":\n" << *jvp);
-  return errorOccurred;
-}
-
 //===----------------------------------------------------------------------===//
 // `[differentiable]` attribute processing
 //===----------------------------------------------------------------------===//
@@ -6199,7 +7673,7 @@ static SILFunction *createEmptyVJP(
   auto vjpGenericSig = getAssociatedFunctionGenericSignature(attr, original);
 
   // RAII that pushes the original function's generic signature to
-  // `module.Types` so that the calls `module.Types.getTypeLowering()` below
+  // `module.Types` so that calls to `module.Types.getTypeLowering()` below
   // will know the VJP's generic parameter types.
   Lowering::GenericContextScope genericContextScope(
       module.Types, vjpGenericSig);
@@ -6250,7 +7724,7 @@ static SILFunction *createEmptyJVP(
   auto jvpGenericSig = getAssociatedFunctionGenericSignature(attr, original);
 
   // RAII that pushes the original function's generic signature to
-  // `module.Types` so that the calls `module.Types.getTypeLowering()` below
+  // `module.Types` so that calls to `module.Types.getTypeLowering()` below
   // will know the VJP's generic parameter types.
   Lowering::GenericContextScope genericContextScope(
       module.Types, jvpGenericSig);
@@ -6335,7 +7809,59 @@ bool ADContext::processDifferentiableAttribute(
   }
 
   // If the JVP doesn't exist, need to synthesize it.
-  auto vjpGenerated = false;
+  if (!jvp) {
+    // Diagnose:
+    // - Functions with no return.
+    // - Functions with unsupported control flow.
+    if (RunJVPGeneration && (diagnoseNoReturn(*this, original, invoker) ||
+        diagnoseUnsupportedControlFlow(*this, original, invoker)))
+      return true;
+
+    jvp = createEmptyJVP(*this, original, attr, isAssocFnExported);
+    getGeneratedFunctions().push_back(jvp);
+
+    // For now, only run JVP emission if the flag is on and if there is no
+    // user defined VJP. If there is a user defined VJP but no JVP, that means
+    // the user should have provided a custom JVP as well since we likely
+    // cannot derive a custom JVP. Thus create empty body.
+    if (RunJVPGeneration && !vjp) {
+      JVPEmitter emitter(*this, original, attr, jvp, invoker);
+      if (emitter.run())
+        return true;
+    } else {
+      LLVM_DEBUG(getADDebugStream()
+                 << "Generating empty JVP for original @"
+                 << original->getName() << '\n');
+      // Create empty body of JVP if the user defined their own custom VJP.
+      auto *entry = jvp->createBasicBlock();
+      createEntryArguments(jvp);
+      SILBuilder builder(entry);
+      auto loc = jvp->getLocation();
+      // Add a fatal error in case this function is called by the user.
+      auto fatalErrrorJvpType = SILFunctionType::get(
+          /*genericSig*/ nullptr,
+          SILFunctionType::ExtInfo().withRepresentation(
+              SILFunctionTypeRepresentation::Thin),
+          SILCoroutineKind::None, ParameterConvention::Direct_Unowned, {},
+          /*interfaceYields*/ {},
+          SILResultInfo(module.getASTContext().getNeverType(),
+                        ResultConvention::Unowned),
+          /*interfaceErrorResults*/ None, getASTContext());
+      auto fnBuilder = SILOptFunctionBuilder(getTransform());
+      auto *fatalErrrorJvpFunc = fnBuilder.getOrCreateFunction(
+          loc, "_printJVPErrorAndExit", SILLinkage::PublicExternal,
+          fatalErrrorJvpType, IsNotBare, IsNotTransparent, IsNotSerialized,
+          IsNotDynamic, ProfileCounter(), IsNotThunk);
+      auto *jvpErrorFuncRef =
+          builder.createFunctionRef(loc, fatalErrrorJvpFunc);
+      builder.createApply(loc, jvpErrorFuncRef, SubstitutionMap(), {});
+      builder.createUnreachable(loc);
+      LLVM_DEBUG(getADDebugStream() << "Generated empty JVP for "
+                 << original->getName() << ":\n" << *jvp);
+    }
+  }
+
+  // If the VJP doesn't exist, need to synthesize it.
   if (!vjp) {
     // Diagnose:
     // - Functions with no return.
@@ -6343,48 +7869,11 @@ bool ADContext::processDifferentiableAttribute(
     if (diagnoseNoReturn(*this, original, invoker) ||
         diagnoseUnsupportedControlFlow(*this, original, invoker))
       return true;
-    
-    vjpGenerated = true;
+
     vjp = createEmptyVJP(*this, original, attr, isAssocFnExported);
     getGeneratedFunctions().push_back(vjp);
     VJPEmitter emitter(*this, original, attr, vjp, invoker);
-    if (emitter.run()) {
-      return true;
-    }
-  }
-      
-  // If the JVP doesn't exist, need to synthesize it.
-  if (!jvp) {
-    // Diagnose:
-    // - Functions with no return.
-    // - Functions with unsupported control flow.
-    if (vjpGenerated && (diagnoseNoReturn(*this, original, invoker) ||
-        diagnoseUnsupportedControlFlow(*this, original, invoker)))
-      return true;
-
-    jvp = createEmptyJVP(*this, original, attr, isAssocFnExported);
-    getGeneratedFunctions().push_back(jvp);
-
-    if (vjpGenerated) {
-      JVPEmitter emitter(*this, original, attr, jvp, invoker);
-      return emitter.run();
-    } else {
-      LLVM_DEBUG(getADDebugStream()
-                 << "Generating empty JVP for original @"
-                 << original->getName() << '\n');
-      // Create empty body of JVP if the user defined their own custom VJP.
-      // Return undef.
-      auto *entry = jvp->createBasicBlock();
-      createEntryArguments(jvp);
-      auto diffConv = jvp->getConventions();
-      SILBuilder builder(entry);
-      auto loc = jvp->getLocation();
-      builder.createReturn(loc, SILUndef::get(
-          jvp->mapTypeIntoContext(diffConv.getSILResultType()),
-          *jvp));
-      LLVM_DEBUG(getADDebugStream() << "Generated empty JVP for "
-                 << original->getName() << ":\n" << *jvp);
-    }
+    return emitter.run();
   }
 
   return false;
