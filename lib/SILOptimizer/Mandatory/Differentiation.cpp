@@ -4514,7 +4514,12 @@ private:
   void emitReturnInstForDifferential() {
     auto &differential = getDifferential();
     auto diffLoc = differential.getLocation();
+    auto *origExit = &*original->findReturnBB();
     auto diffBuilder = getDifferentialBuilder();
+    // Need to manually set insertion point for the differential builder since
+    // super class does not know about this second builder.
+    auto *diffBB = diffBBMap.lookup(origExit);
+    diffBuilder.setInsertionPoint(diffBB);
 
     // This vector will contain all the materialized return elements.
     SmallVector<SILValue, 8> retElts;
@@ -4620,7 +4625,6 @@ private:
     auto differentialResult = differentialAllResults[indices.source];
 
     // Add tangent for original result.
-    // TODO: what about indirect results?
     assert(indices.source == 0 && "Expected result index to be first.");
     if (origResult->getType().isObject())
       setTangentValue(bb, origResult,
@@ -5016,6 +5020,10 @@ private:
     auto loc = bi->getLoc();
     auto *bb = bi->getParent();
     auto &diffBuilder = getDifferentialBuilder();
+    // Need to manually set insertion point for the differential builder since
+    // super class does not know about this second builder.
+    auto *diffBB = diffBBMap.lookup(bb);
+    diffBuilder.setInsertionPoint(diffBB);
 
     // Get all the successors that we can branch to based on the original basic
     // block.
@@ -5029,9 +5037,10 @@ private:
     }
 
     // Get the enum.
+    auto *diffStructArg = getDifferentialStructArgument(bi->getParent());
     auto *branchEnumField = differentialInfo.lookUpLinearMapStructEnumField(bb);
     auto *enumField = diffBuilder.createStructExtract(
-        loc, getDifferentialStructArgument(bi->getParent()), branchEnumField);
+        loc, diffStructArg, branchEnumField);
     
     // Emit inst.
     diffBuilder.createSwitchEnum(loc, enumField, nullptr, branchableBlocks);
@@ -5041,6 +5050,10 @@ private:
     auto loc = cbi->getLoc();
     auto *bb = cbi->getParent();
     auto &diffBuilder = getDifferentialBuilder();
+    // Need to manually set insertion point for the differential builder since
+    // super class does not know about this second builder.
+    auto *diffBB = diffBBMap.lookup(bb);
+    diffBuilder.setInsertionPoint(diffBB);
 
     // Get all the successors that we can branch to based on the original basic
     // block.
@@ -5054,9 +5067,10 @@ private:
     }
 
     // Get the enum.
+    auto *diffStructArg = getDifferentialStructArgument(cbi->getParent());
     auto *branchEnumField = differentialInfo.lookUpLinearMapStructEnumField(bb);
     auto *enumField = diffBuilder.createStructExtract(
-        loc, getDifferentialStructArgument(cbi->getParent()), branchEnumField);
+        loc, diffStructArg, branchEnumField);
 
     // Emit inst.
     diffBuilder.createSwitchEnum(loc, enumField, nullptr, branchableBlocks);
