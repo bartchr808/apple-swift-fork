@@ -4024,7 +4024,7 @@ private:
 
   /// Mapping from original basic blocks and original buffers to corresponding
   /// tangent buffers.
-  DenseMap<std::pair<SILBasicBlock *, SILValue>, SILValue> bufferMap;
+  DenseMap<SILValue, SILValue> bufferMap;
 
   /// An auxiliary differential local allocation builder.
   SILBuilder diffLocalAllocBuilder;
@@ -4313,17 +4313,16 @@ private:
                         SILValue tangentBuffer) {
     assert(originalBuffer->getType().isAddress());
     auto insertion =
-        bufferMap.try_emplace({origBB, originalBuffer}, tangentBuffer);
+        bufferMap.try_emplace(originalBuffer, tangentBuffer);
     assert(insertion.second); (void)insertion;
   }
 
-  SILValue getTangentProjection(SILBasicBlock *origBB,
-                                SILValue originalProjection) {
+  SILValue getTangentProjection(SILValue originalProjection) {
     auto diffBuilder = getDifferentialBuilder();
 
     // Handle `struct_element_addr`.
     if (auto *seai = dyn_cast<StructElementAddrInst>(originalProjection)) {
-      auto adjSource = getTangentBuffer(origBB, seai->getOperand());
+      auto adjSource = getTangentBuffer(seai->getOperand());
       auto *tangentVectorDecl =
           adjSource->getType().getStructOrBoundGenericStruct();
       auto tanFieldLookup =
@@ -4337,11 +4336,12 @@ private:
     // Handle `tuple_element_addr`.
     if (auto *teai = dyn_cast<TupleElementAddrInst>(originalProjection)) {
       auto source = teai->getOperand();
-      auto adjSource = getTangentBuffer(origBB, source);
+      auto adjSource = getTangentBuffer(source);
       // If the adjoint buffer of the source does not have a tuple type, then
       // it must represent a "single element tuple type". Return it directly.
       if (!adjSource->getType().is<TupleType>())
         return adjSource;
+      assert(false);
       auto origTupleTy = source->getType().castTo<TupleType>();
       unsigned adjIndex = 0;
       for (unsigned i : range(teai->getFieldNo())) {
@@ -4355,20 +4355,20 @@ private:
 
     // Handle `begin_access`.
     if (auto *bai = dyn_cast<BeginAccessInst>(originalProjection)) {
-      auto adjBase = getTangentBuffer(origBB, bai->getOperand());
+      auto adjBase = getTangentBuffer(bai->getOperand());
       if (errorOccurred)
-        return (bufferMap[{origBB, originalProjection}] = SILValue());
+        return (bufferMap[originalProjection] = SILValue());
       // Return the base buffer's tangent buffer.
       return adjBase;
     }
     return SILValue();
   }
 
-  SILValue &getTangentBuffer(SILBasicBlock *origBB, SILValue originalBuffer) {
+  SILValue &getTangentBuffer(SILValue originalBuffer) {
     auto diffBuilder = getDifferentialBuilder();
     assert(originalBuffer->getType().isAddress());
     assert(originalBuffer->getFunction() == original);
-    auto insertion = bufferMap.try_emplace({origBB, originalBuffer},
+    auto insertion = bufferMap.try_emplace(originalBuffer,
                                            SILValue());
     if (!insertion.second) // not inserted.
       return insertion.first->getSecond();
@@ -4380,14 +4380,14 @@ private:
             originalBuffer, invoker,
             diag::autodiff_noderivative_stored_property);
         errorOccurred = true;
-        return (bufferMap[{origBB, originalBuffer}] = SILValue());
+        return (bufferMap[originalBuffer] = SILValue());
       }
     }
 
     // If the original buffer is a projection, return a corresponding projection
     // into the tangent buffer.
-    if (auto tanProj = getTangentProjection(origBB, originalBuffer)) {
-      return (bufferMap[{origBB, originalBuffer}] = tanProj);
+    if (auto tanProj = getTangentProjection(originalBuffer)) {
+      return (bufferMap[originalBuffer] = tanProj);
     }
 
     // Set insertion point for local allocation builder: before the last local
@@ -4533,9 +4533,9 @@ private:
       auto origResult = results[resultIndex];
       assert(origResult->getType().isObject() &&
              "Should only be handling direct results for return inst");
-        auto diffVal = getTangentValue(exitBasicBlock, origResult);
-        auto val = materializeTangent(diffVal, diffLoc);
-        retElts.push_back(val);
+      auto diffVal = getTangentValue(exitBasicBlock, origResult);
+      auto val = materializeTangent(diffVal, diffLoc);
+      retElts.push_back(val);
     };
     // Collect differentiation parameter adjoints.
     for (auto i : range(results.size()))
@@ -4580,7 +4580,7 @@ private:
           tanParam = materializeTangent(getTangentValue(bb, origArg), loc);
         }
       } else {
-        tanParam = getTangentBuffer(ai->getParent(), origArg);
+        tanParam = getTangentBuffer(origArg);
         if (errorOccurred)
           return;
       }
@@ -4697,7 +4697,7 @@ private:
     auto *bb = li->getParent();
     auto diffBuilder = getDifferentialBuilder();
 
-    auto tanValSrc = getTangentBuffer(bb, li->getOperand());
+    auto tanValSrc = getTangentBuffer(li->getOperand());
     auto *tanValDest = diffBuilder.createLoad(li->getLoc(), tanValSrc,
         getBufferLOQ(li->getType().getASTType(),
         getDifferential()));
@@ -4712,7 +4712,7 @@ private:
     auto &diffBuilder = getDifferentialBuilder();
     auto tanValSrc = materializeTangent(getTangentValue(bb, si->getSrc()),
                                         si->getLoc());
-    auto tanValDest = getTangentBuffer(bb, si->getDest());
+    auto tanValDest = getTangentBuffer(si->getDest());
     diffBuilder.createStore(si->getLoc(), tanValSrc, tanValDest,
                             getBufferSOQ(tanValDest->getType().getASTType(),
                                          getDifferential()));
@@ -4731,9 +4731,8 @@ private:
 
     auto diffBuilder = getDifferentialBuilder();
     auto loc = cai->getLoc();
-    auto *bb = cai->getParent();
-    auto &tanSrc = getTangentBuffer(bb, cai->getSrc());
-    auto tanDest = getTangentBuffer(bb, cai->getDest());
+    auto &tanSrc = getTangentBuffer(cai->getSrc());
+    auto tanDest = getTangentBuffer(cai->getDest());
     if (errorOccurred)
       return;
 
@@ -4768,14 +4767,13 @@ private:
     auto *mappedAllocStackInst =
         diffBuilder.createAllocStack(
             asi->getLoc(), getRemappedTangentType(asi->getElementType()));
-    bufferMap.try_emplace({asi->getParent(), asi},
-                          mappedAllocStackInst);
+    bufferMap.try_emplace(asi, mappedAllocStackInst);
   }
 
   /// Emit the same instruction but on the tangent instead.
   void emitTangentForDeallocStackInst(DeallocStackInst *dsi) {
     auto &diffBuilder = getDifferentialBuilder();
-    auto tanBuffer = getTangentBuffer(dsi->getParent(), dsi->getOperand());
+    auto tanBuffer = getTangentBuffer(dsi->getOperand());
     diffBuilder.createDeallocStack(dsi->getLoc(), tanBuffer);
   }
 
@@ -4966,7 +4964,6 @@ private:
   }
 
   void emitTangentForTupleElementAddrInst(TupleElementAddrInst *teai) {
-    auto *bb = teai->getParent();
     auto &diffBuilder = getDifferentialBuilder();
     auto origTupleTy = teai->getOperand()->getType().castTo<TupleType>();
     unsigned tanIndex = 0;
@@ -4976,17 +4973,18 @@ private:
         ++tanIndex;
     }
     auto tanType = getRemappedTangentType(teai->getType());
-    auto tanSource = getTangentBuffer(bb, teai->getOperand());
+    auto tanSource = getTangentBuffer(teai->getOperand());
     SILValue tanBuffer;
     // If the tangent buffer of the source does not have a tuple type, then
     // it must represent a "single element tuple type". Use it directly.
     if (!tanSource->getType().is<TupleType>()) {
       tanBuffer = tanSource;
     } else {
+      assert(false);
       tanBuffer = diffBuilder.createTupleElementAddr(
           teai->getLoc(), tanSource, tanIndex, tanType);
     }
-    bufferMap.try_emplace({teai->getParent(), teai}, tanBuffer);
+    bufferMap.try_emplace(teai, tanBuffer);
   }
 
   void emitTangentForTupleExtractInst(TupleExtractInst *teai) {
@@ -5012,7 +5010,7 @@ private:
     } else {
       tanBuffer = diffBuilder.createTupleExtract(
            loc, tanSource, tanIndex, tanType);
-      bufferMap.try_emplace({teai->getParent(), teai}, tanBuffer);
+      bufferMap.try_emplace(teai, tanBuffer);
     }
   }
 
@@ -5043,7 +5041,14 @@ private:
         loc, diffStructArg, branchEnumField);
     
     // Emit inst.
-    diffBuilder.createSwitchEnum(loc, enumField, nullptr, branchableBlocks);
+    if (branchableBlocks.size() == 1) {
+      auto *payload = diffBuilder.createUncheckedEnumData(
+          loc, enumField, branchableBlocks.front().first);
+      SmallVector<SILValue, 1> args {payload};
+      diffBuilder.createBranch(loc, branchableBlocks.front().second, args);
+    } else {
+      diffBuilder.createSwitchEnum(loc, enumField, nullptr, branchableBlocks);
+    }
   }
 
   void emitTangentForCondBranchInst(CondBranchInst *cbi) {
@@ -5073,7 +5078,14 @@ private:
         loc, diffStructArg, branchEnumField);
 
     // Emit inst.
-    diffBuilder.createSwitchEnum(loc, enumField, nullptr, branchableBlocks);
+    if (branchableBlocks.size() == 1) {
+      auto *payload = diffBuilder.createUncheckedEnumData(
+          loc, enumField, branchableBlocks.front().first);
+      SmallVector<SILValue, 1> args {payload};
+      diffBuilder.createBranch(loc, branchableBlocks.front().second, args);
+    } else {
+      diffBuilder.createSwitchEnum(loc, enumField, nullptr, branchableBlocks);
+    }
   }
 
   void startDifferentialGeneration() {
@@ -5373,6 +5385,10 @@ public:
   }
 
   void visitInstructionsInBlock(SILBasicBlock *bb) {
+    if (!bb->getTerminator()->isBranch()) {
+      exitBasicBlock = bb;
+    }
+
     auto *jvpBB = BBMap[bb];
     assert(jvpBB && "basic block should exist.");
     if (bb != original->getEntryBlock()) {
@@ -5391,6 +5407,10 @@ public:
       auto *lastArg = diffBB->getArguments().back();
       assert(lastArg->getType() == diffStructLoweredType);
       differentialStructArguments[bb] = lastArg;
+
+      for (auto &arg : bb->getArguments()) {
+        setTangentValue(bb, arg, makeConcreteTangentValue(arg));
+      }
     }
     TypeSubstCloner::visitInstructionsInBlock(bb);
   }
@@ -5685,7 +5705,7 @@ public:
 
   void visitReturnInst(ReturnInst *ri) {
     auto loc = ri->getOperand().getLoc();
-    exitBasicBlock = ri->getParent();
+//    exitBasicBlock = ri->getParent();
     auto &builder = getBuilder();
 
     // Get the JVP value corresponding to the original functions's return value.
@@ -5806,10 +5826,13 @@ public:
     for (auto origArg : bi->getArgs())
       args.push_back(getOpValue(origArg));
     SILValue payloadPointer;
-    if (bb->isEntry())
-      payloadPointer = bb0Struct;
-    else
+    if (bb->isEntry()) {
+      SILType builtinRawPtrTy = SILType::getRawPointerType(getASTContext());
+      payloadPointer = builder.createAddressToPointer(loc, bb0Struct,
+                                                      builtinRawPtrTy);
+    } else {
       payloadPointer = jvpBB->getArgument(0);
+    }
     args.push_back(payloadPointer);
 
     builder.createBranch(loc, trampBB, args);
