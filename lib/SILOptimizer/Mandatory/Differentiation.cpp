@@ -4158,7 +4158,7 @@ private:
 
   SILBasicBlock *createTrampolineBlock(SILBasicBlock *bb) {
     auto *trampBlock = jvp->createBasicBlock();
-    for (auto arg : bb->getArguments())
+    for (auto &arg : bb->getArguments())
       trampBlock->createPhiArgument(arg->getType(), arg->getOwnershipKind());
     addPayloadPointerArgument(bb, trampBlock);
 
@@ -4215,8 +4215,8 @@ private:
 
     // Remap arguments, adding the payload pointer.
     SmallVector<SILValue, 8> args;
-    for (auto origArg : origSuccBB->getArguments())
-      args.push_back(getOpValue(origArg));
+    for (auto origArg : trampBB->getArguments().drop_back())
+      args.push_back(origArg);
     args.push_back(newPayloadPointer);
 
     // Step 4: create the branch.
@@ -4533,13 +4533,17 @@ private:
       auto origResult = results[resultIndex];
       assert(origResult->getType().isObject() &&
              "Should only be handling direct results for return inst");
+      origResult->dump();
       auto diffVal = getTangentValue(exitBasicBlock, origResult);
+      diffVal.getConcreteValue()->dump();
       auto val = materializeTangent(diffVal, diffLoc);
+      val->dump();
       retElts.push_back(val);
     };
     // Collect differentiation parameter adjoints.
-    for (auto i : range(results.size()))
+    for (auto i : range(results.size())) {
       addRetElt(i);
+    }
 
     diffBuilder.createReturn(
         diffLoc, joinElements(retElts, diffBuilder, diffLoc));
@@ -5099,6 +5103,13 @@ private:
     auto *origEntry = original->getEntryBlock();
     for (auto &origBB : *original) {
       auto *diffBB = differential.createBasicBlock();
+      // Copy over tangent type of original arguments for non entry blocks.
+      if (!origBB.isEntry()) {
+        for (auto &arg : origBB.getArguments()) {
+          auto diffType = getRemappedTangentType(arg->getType());
+          diffBB->createPhiArgument(diffType, arg->getOwnershipKind());
+        }
+      }
       diffBBMap.insert({&origBB, diffBB});
       {
         Lowering::GenericContextScope genericContextScope(
@@ -5408,8 +5419,13 @@ public:
       assert(lastArg->getType() == diffStructLoweredType);
       differentialStructArguments[bb] = lastArg;
 
-      for (auto &arg : bb->getArguments()) {
-        setTangentValue(bb, arg, makeConcreteTangentValue(arg));
+//      for (auto &arg : bb->getArguments()) {
+//        setTangentValue(bb, arg, makeConcreteTangentValue(arg));
+//      }
+      for (auto i : range(bb->getNumArguments())) {
+        auto arg = bb->getArgument(i);
+        auto diffArg = diffBB->getArgument(i);
+        setTangentValue(bb, arg, makeConcreteTangentValue(diffArg));
       }
     }
     TypeSubstCloner::visitInstructionsInBlock(bb);
