@@ -3002,6 +3002,37 @@ IndexSubset *TypeChecker::inferDifferentiationParameters(
   return IndexSubset::get(ctx, parameterBits);
 }
 
+IndexSubset *TypeChecker::inferTransposingParameters(
+    AbstractFunctionDecl *AFD, GenericEnvironment *derivativeGenEnv,
+    bool isCurried) {
+  auto &ctx = AFD->getASTContext();
+
+  // Get transpose results.
+  auto *transposeFunctionType =
+      AFD->getInterfaceType()->castTo<AnyFunctionType>();
+  ArrayRef<TupleTypeElt> transposeResultTypes;
+  // Return type of '@transpose' function can be a singular type or a tuple
+  // type.
+  auto transposeResultType = transposeFunctionType->getResult();
+  if (isCurried)
+    transposeResultType =
+        transposeResultType->castTo<AnyFunctionType>()->getResult();
+  if (auto resultTupleType = transposeResultType->getAs<TupleType>()) {
+    transposeResultTypes = resultTupleType->getElements();
+  } else {
+    transposeResultTypes = ArrayRef<TupleTypeElt>(transposeResultType);
+  }
+
+  // NOTE: there is no validation that the type is transposable. This will be
+  // done later in the code when calculating the expected original
+  // function type.
+  llvm::SmallBitVector parameterBits(transposeResultTypes.size());
+  for (unsigned i : range(parameterBits.size()))
+    parameterBits.set(i);
+
+  return IndexSubset::get(ctx, parameterBits);
+}
+
 // Computes `IndexSubset` from the given parsed differentiation parameters
 // (possibly empty) for the given function and derivative generic environment,
 // then verifies that the parameter indices are valid.
@@ -4258,23 +4289,17 @@ static IndexSubset *computeTransposedParameters(
   auto &ctx = transposeFunction->getASTContext();
   auto &diags = ctx.Diags;
 
-  // Get function type and parameters.
+  // Get function type.
   auto *transposeFunctionType =
       transposeFunction->getInterfaceType()->castTo<AnyFunctionType>();
 
-  ArrayRef<TupleTypeElt> transposeResultTypes;
-  // Return type of '@transpose' function can be a singular type or a tuple
-  // type.
-  auto transposeResultType = transposeFunctionType->getResult();
-  if (isCurried)
-    transposeResultType =
-        transposeResultType->castTo<AnyFunctionType>()->getResult();
-  if (auto resultTupleType = transposeResultType->getAs<TupleType>()) {
-    transposeResultTypes = resultTupleType->getElements();
-  } else {
-    transposeResultTypes = ArrayRef<TupleTypeElt>(transposeResultType);
-  }
   auto isInstanceMethod = transposeFunction->isInstanceMember();
+
+  // If parsed transposing parameters are empty, infer parameter indices
+  // from the function type.
+  if (parsedWrtParams.empty())
+    return TypeChecker::inferTransposingParameters(transposeFunction,
+                                                   derivativeGenEnv, isCurried);
 
   // Otherwise, build parameter indices from parsed differentiation parameters.
   auto numUncurriedParams = transposeFunctionType->getNumParams();

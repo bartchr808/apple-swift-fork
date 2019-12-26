@@ -1675,6 +1675,11 @@ public:
   inferDifferentiationParameters(AbstractFunctionDecl *AFD,
                                  GenericEnvironment *derivativeGenEnv);
 
+  static IndexSubset *
+  inferTransposingParameters(AbstractFunctionDecl *AFD,
+                             GenericEnvironment *derivativeGenEnv,
+                             bool isCurried);
+
 public:
   /// Require that the library intrinsics for working with Optional<T>
   /// exist.
